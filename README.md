@@ -96,3 +96,6 @@ A representative session consisting of `git init` + one `git commit` + `git push
 The git internals reference in [`references/git-internals.md`](references/git-internals.md) is a genuinely useful document for anyone curious about how git stores data under the hood.
 
 The rest of this project is a monument to the idea that just because you *can* make an LLM do something doesn't mean you *should*. It is also, somehow, fully functional.
+
+> [!IMPORTANT]
+> This repository — including its initial commit, every subsequent commit, and every push to GitHub — was managed exclusively using this skill. The `git` binary was never invoked. Not even once. You are reading a README that was written, committed, and pushed entirely by an LLM reimplementing git from scratch in inline Python. We have the API bills to prove it.
