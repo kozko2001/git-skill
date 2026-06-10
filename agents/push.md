@@ -258,22 +258,16 @@ def encode_obj_header(obj_type, size):
     result.append(first)
     return bytes(result)
 
-def collect_objects(commit_sha, stop_sha=None):
-    """Collect all unique objects reachable from commit_sha, stopping at stop_sha."""
-    seen = set()
-    queue = [commit_sha]
-    if stop_sha:
-        # Pre-populate with objects already on remote (approximation: just the commit)
-        seen.add(stop_sha)
-
+def collect_reachable(sha, seen):
+    """Recursively collect all objects reachable from sha into seen."""
+    queue = [sha]
     while queue:
-        sha = queue.pop()
-        if sha in seen: continue
-        seen.add(sha)
-        obj_type, body = read_obj(sha)
+        s = queue.pop()
+        if s in seen: continue
+        seen.add(s)
+        obj_type, body = read_obj(s)
         if obj_type == 'commit':
-            lines = body.decode().split('\n')
-            for line in lines:
+            for line in body.decode().split('\n'):
                 if line.startswith('tree '): queue.append(line[5:])
                 elif line.startswith('parent '): queue.append(line[7:])
         elif obj_type == 'tree':
@@ -281,10 +275,18 @@ def collect_objects(commit_sha, stop_sha=None):
             while i < len(body):
                 sp = body.index(b' ', i)
                 null = body.index(b'\x00', sp)
-                entry_sha = body[null+1:null+21].hex()
-                queue.append(entry_sha)
+                queue.append(body[null+1:null+21].hex())
                 i = null + 21
-    return seen
+
+def collect_objects(commit_sha, stop_sha=None):
+    """Collect objects reachable from commit_sha that are NOT reachable from stop_sha."""
+    already_remote = set()
+    if stop_sha:
+        collect_reachable(stop_sha, already_remote)
+
+    needed = set()
+    collect_reachable(commit_sha, needed)
+    return needed - already_remote
 
 def build_pack(object_shas):
     objects_data = b''
@@ -337,7 +339,7 @@ def pkt_line(data):
 
 def build_push_payload(old_sha, new_sha, branch, pack_path):
     payload = b''
-    ref_line = f"{old_sha} {new_sha} refs/heads/{branch}\x00 side-band-64k agent=git-skill/1.0\n"
+    ref_line = f"{old_sha} {new_sha} refs/heads/{branch}\x00report-status side-band-64k agent=git-skill/1.0\n"
     payload += pkt_line(ref_line)
     payload += b'0000'  # flush
     with open(pack_path, 'rb') as f:
@@ -351,7 +353,7 @@ payload = build_push_payload(old_sha, LOCAL_SHA, BRANCH, PACK_FILE)
 
 # Send to remote via SSH
 proc = subprocess.Popen(
-    ['ssh', SSH_HOST, f'git-receive-pack \'{REPO_PATH}\''],
+    ['ssh', '-l', 'git', SSH_HOST, f'git-receive-pack \'{REPO_PATH}\''],
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE
