@@ -1,195 +1,202 @@
 # Agent: git commit
 
-Create a new commit from the current working tree state.
+Create a new commit from the working tree. No `git` binary, no python3.
+
+Read `references/git-internals.md` first — provides `git_compress`, `git_hash_object`, `git_decompress`.
 
 ## Before starting
 
-Ask the user (if not already provided):
+Ask the user for (if not already provided):
 1. **Commit message** — required
-2. **Files to commit** — default is all files in the working directory; user can specify a subset
-3. **Author name and email** — read from `.git/config` first; ask only if not configured
+2. **Files to commit** — default: all tracked files; user can specify a subset
+3. **Author** — read from `.git/config`; ask only if missing
 
-Read author from config:
 ```bash
-python3 -c "
-import re
-try:
-    cfg = open('.git/config').read()
-    n = re.search(r'name\s*=\s*(.+)', cfg)
-    e = re.search(r'email\s*=\s*(.+)', cfg)
-    print('NAME:', n.group(1).strip() if n else '')
-    print('EMAIL:', e.group(1).strip() if e else '')
-except: print('NAME:\nEMAIL:')
-"
+# Read author from config
+author_name=$(awk '/^\[user\]/{u=1} u&&/name *=/{gsub(/.*= */,""); print; exit}' .git/config)
+author_email=$(awk '/^\[user\]/{u=1} u&&/email *=/{gsub(/.*= */,""); print; exit}' .git/config)
 ```
+
+---
+
+## Inline helpers
+
+```bash
+git_compress() {
+    local infile="$1" outfile="$2"
+    local tmpgz; tmpgz=$(mktemp)
+    gzip -1 -c -n "$infile" > "$tmpgz"
+    local gz_size; gz_size=$(wc -c < "$tmpgz")
+    local ds=$(( gz_size - 18 ))
+    local adler
+    adler=$(od -A n -t u1 -v "$infile" | tr -s ' \n' ' ' | sed 's/^ //;s/ $//' | \
+        awk 'BEGIN{a=1;b=0;m=65521}
+             {n=split($0,v," ");for(i=1;i<=n;i++){d=v[i]+0;a=(a+d)%m;b=(b+a)%m}}
+             END{printf "%02x%02x%02x%02x",int(b/256)%256,b%256,int(a/256)%256,a%256}')
+    mkdir -p "$(dirname "$outfile")"
+    { printf '\x78\x9c'
+      dd if="$tmpgz" bs=1 skip=10 count="$ds" 2>/dev/null
+      printf "$(printf '%s' "$adler" | sed 's/../\\x&/g')"
+    } > "$outfile"
+    rm -f "$tmpgz"
+}
+
+git_hash_object() {
+    local type="$1" infile="$2"
+    local size; size=$(wc -c < "$infile")
+    { printf "%s %d\0" "$type" "$size"; cat "$infile"; } | sha1sum | cut -d' ' -f1
+}
+```
+
+---
 
 ## Steps
 
-### 1. Collect files to commit
-
-Either use a user-specified list, or scan the working tree (excluding `.git/`):
+### 1. Collect files
 
 ```bash
-find . -not -path './.git/*' -not -name '.git' -type f | sort
+# All files except .git/
+mapfile -t FILES < <(find . -not -path './.git/*' -not -name '.git' -type f | sort)
+# Or a user-specified list:
+# FILES=("src/main.c" "README.md")
 ```
 
-If the repo has a `.gitignore`, read it and filter accordingly. For simplicity, honor only the patterns listed in `.gitignore` at the root.
+If a `.gitignore` exists, filter out matching patterns:
+```bash
+while IFS= read -r pat; do
+    [[ "$pat" =~ ^#|^$ ]] && continue
+    FILES=( "${FILES[@]/$pat}" )     # basic substring filter; for globs use find -not -name
+done < .gitignore 2>/dev/null
+```
 
 ### 2. Create blob objects for all files
 
-Run this Python block (builds blobs + full tree in one pass):
+```bash
+declare -A blob_shas   # path → sha
+
+for f in "${FILES[@]}"; do
+    [ -z "$f" ] && continue
+    sha=$(git_hash_object blob "$f")
+    obj_path=".git/objects/${sha:0:2}/${sha:2}"
+    [ ! -f "$obj_path" ] && git_compress "$f" "$obj_path"
+    blob_shas["$f"]="$sha"
+done
+```
+
+### 3. Build tree objects (bottom-up)
+
+Sort directories deepest-first so subtrees exist before their parents:
 
 ```bash
-python3 << 'PYEOF'
-import zlib, hashlib, os, sys, time, re
+hex_to_bin() { printf "$(printf '%s' "$1" | sed 's/../\\x&/g')"; }
 
-GIT_DIR = '.git'
-FILES = None  # replace with list of paths, or None for all
+build_tree() {
+    local dir="$1"   # e.g. "." or "src"
+    local prefix="${dir#./}"
+    [ "$prefix" = "." ] && prefix=""
 
-def write_obj(obj_type, content):
-    if isinstance(content, str):
-        content = content.encode()
-    store = f"{obj_type} {len(content)}\x00".encode() + content
-    sha = hashlib.sha1(store).hexdigest()
-    out_dir = f"{GIT_DIR}/objects/{sha[:2]}"
-    out_path = f"{out_dir}/{sha[2:]}"
-    os.makedirs(out_dir, exist_ok=True)
-    if not os.path.exists(out_path):
-        with open(out_path, 'wb') as f:
-            f.write(zlib.compress(store))
-    return sha
+    local tmpentries; tmpentries=$(mktemp)
 
-def build_tree_for_dir(dir_path, ignore_root_git=True):
-    entries = []
-    try:
-        items = sorted(os.listdir(dir_path))
-    except PermissionError:
-        return None
-    for name in items:
-        if ignore_root_git and name == '.git':
-            continue
-        full = os.path.join(dir_path, name)
-        if os.path.islink(full):
-            target = os.readlink(full).encode()
-            sha = write_obj('blob', target)
-            entries.append(('120000', name, sha))
-        elif os.path.isfile(full):
-            with open(full, 'rb') as f:
-                content = f.read()
-            sha = write_obj('blob', content)
-            mode = '100755' if os.access(full, os.X_OK) else '100644'
-            entries.append((mode, name, sha))
-        elif os.path.isdir(full):
-            sub_sha = build_tree_for_dir(full, ignore_root_git=False)
-            if sub_sha:
-                entries.append(('40000', name, sub_sha))
-    if not entries:
-        return None
+    # Sub-directories
+    while IFS= read -r subdir; do
+        local name; name=$(basename "$subdir")
+        local sub_sha; sub_sha=$(build_tree "$subdir")
+        [ -z "$sub_sha" ] && continue
+        printf '%s %s\n' "40000 $name" "$sub_sha"
+    done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d ! -name '.git' | sort) >> "$tmpentries"
 
-    def sort_key(e):
-        mode, name, _ = e
-        return name + '/' if mode in ('40000', '040000') else name
+    # Files in this directory
+    for f in "${FILES[@]}"; do
+        [ -z "$f" ] && continue
+        local fdir; fdir=$(dirname "$f")
+        local fname; fname=$(basename "$f")
+        # Normalize: strip leading ./
+        local norm_dir="${fdir#./}"
+        [ "$norm_dir" = "." ] && norm_dir=""
+        [ "$norm_dir" != "$prefix" ] && continue
 
-    entries.sort(key=sort_key)
-    content = b''
-    for mode, name, sha in entries:
-        content += f"{mode} {name}\x00".encode()
-        content += bytes.fromhex(sha)
-    return write_obj('tree', content)
+        local sha="${blob_shas[$f]}"
+        [ -x "$f" ] && mode="100755" || mode="100644"
+        printf '%s %s\n' "$mode $fname" "$sha"
+    done >> "$tmpentries"
 
-# Build the tree
-tree_sha = build_tree_for_dir('.')
-print(f"TREE:{tree_sha}")
+    # Sort entries (files by name; dirs by name + "/")
+    local sorted; sorted=$(sort "$tmpentries")
+    rm -f "$tmpentries"
 
-# Get parent SHA
-head = open(f'{GIT_DIR}/HEAD').read().strip()
-parent_sha = None
-if head.startswith('ref: '):
-    ref_path = f"{GIT_DIR}/{head[5:]}"
-    if os.path.exists(ref_path):
-        parent_sha = open(ref_path).read().strip() or None
-else:
-    parent_sha = head if len(head) == 40 else None
+    [ -z "$sorted" ] && return 0  # empty dir → no tree
 
-print(f"PARENT:{parent_sha or ''}")
-print(f"BRANCH:{head[len('ref: refs/heads/'):] if head.startswith('ref: refs/heads/') else 'DETACHED'}")
-PYEOF
+    # Build binary tree content
+    local tmptree; tmptree=$(mktemp)
+    while IFS=' ' read -r mode_name sha; do
+        local mode="${mode_name% *}"
+        local name="${mode_name#* }"
+        printf '%s %s\0' "$mode" "$name" >> "$tmptree"
+        hex_to_bin "$sha"              >> "$tmptree"
+    done <<< "$sorted"
+
+    local tree_sha; tree_sha=$(git_hash_object tree "$tmptree")
+    local obj_path=".git/objects/${tree_sha:0:2}/${tree_sha:2}"
+    [ ! -f "$obj_path" ] && git_compress "$tmptree" "$obj_path"
+    rm -f "$tmptree"
+
+    printf '%s' "$tree_sha"
+}
+
+root_tree_sha=$(build_tree ".")
 ```
 
-Note the `TREE:`, `PARENT:`, and `BRANCH:` values from the output.
-
-### 3. Build and store the commit object
+### 4. Resolve parent SHA
 
 ```bash
-python3 << 'PYEOF'
-import zlib, hashlib, os, time
-
-GIT_DIR = '.git'
-
-def write_obj(obj_type, content):
-    if isinstance(content, str):
-        content = content.encode()
-    store = f"{obj_type} {len(content)}\x00".encode() + content
-    sha = hashlib.sha1(store).hexdigest()
-    out_dir = f"{GIT_DIR}/objects/{sha[:2]}"
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = f"{out_dir}/{sha[2:]}"
-    if not os.path.exists(out_path):
-        with open(out_path, 'wb') as f:
-            f.write(zlib.compress(store))
-    return sha
-
-# Replace these with actual values
-TREE_SHA   = "REPLACE_TREE_SHA"
-PARENT_SHA = "REPLACE_PARENT_SHA"   # empty string if first commit
-AUTHOR_NAME  = "REPLACE_NAME"
-AUTHOR_EMAIL = "REPLACE_EMAIL"
-MESSAGE    = "REPLACE_MESSAGE"
-BRANCH     = "REPLACE_BRANCH"       # e.g. "main"
-
-ts = int(time.time())
-tz = "+0000"
-author_str = f"{AUTHOR_NAME} <{AUTHOR_EMAIL}> {ts} {tz}"
-
-lines = [f"tree {TREE_SHA}"]
-if PARENT_SHA:
-    lines.append(f"parent {PARENT_SHA}")
-lines += [
-    f"author {author_str}",
-    f"committer {author_str}",
-    "",
-    MESSAGE
-]
-commit_content = "\n".join(lines)
-commit_sha = write_obj('commit', commit_content)
-
-# Update branch ref
-if BRANCH != 'DETACHED':
-    ref_path = f"{GIT_DIR}/refs/heads/{BRANCH}"
-    os.makedirs(os.path.dirname(ref_path), exist_ok=True)
-    with open(ref_path, 'w') as f:
-        f.write(commit_sha + '\n')
-else:
-    with open(f'{GIT_DIR}/HEAD', 'w') as f:
-        f.write(commit_sha + '\n')
-
-print(f"[{BRANCH} {commit_sha[:7]}] {MESSAGE.split(chr(10))[0]}")
-PYEOF
+head=$(cat .git/HEAD)
+case "$head" in
+    ref:\ *) ref="${head#ref: }"; parent=$(cat ".git/$ref" 2>/dev/null | tr -d '\n') ;;
+    *)       parent=$(printf '%s' "$head" | tr -d '\n') ;;
+esac
+branch=$(printf '%s' "$head" | sed 's|ref: refs/heads/||' | tr -d '\n')
 ```
 
-### 4. Report success
+### 5. Build and store the commit object
 
+```bash
+COMMIT_MESSAGE="REPLACE_WITH_ACTUAL_MESSAGE"
+[ -z "$author_name" ]  && author_name="Unknown"
+[ -z "$author_email" ] && author_email="unknown@example.com"
+
+ts=$(date +%s)
+tz=$(date +%z)
+author_str="$author_name <$author_email> $ts $tz"
+
+tmpcmt=$(mktemp)
+printf 'tree %s\n' "$root_tree_sha" > "$tmpcmt"
+[ -n "$parent" ] && printf 'parent %s\n' "$parent" >> "$tmpcmt"
+printf 'author %s\nauthor %s\n\n%s\n' \
+    "$author_str" "$author_str" "$COMMIT_MESSAGE" >> "$tmpcmt"
+# Note: second 'author' line should be 'committer' — fix:
+{
+    printf 'tree %s\n' "$root_tree_sha"
+    [ -n "$parent" ] && printf 'parent %s\n' "$parent"
+    printf 'author %s\ncommitter %s\n\n%s\n' "$author_str" "$author_str" "$COMMIT_MESSAGE"
+} > "$tmpcmt"
+
+commit_sha=$(git_hash_object commit "$tmpcmt")
+obj_path=".git/objects/${commit_sha:0:2}/${commit_sha:2}"
+git_compress "$tmpcmt" "$obj_path"
+rm -f "$tmpcmt"
 ```
-[main a1b2c3d] Your commit message
- 3 files changed
+
+### 6. Update the branch ref
+
+```bash
+if printf '%s' "$head" | grep -q '^ref: '; then
+    ref="${head#ref: }"
+    mkdir -p "$(dirname ".git/$ref")"
+    printf '%s\n' "$commit_sha" > ".git/$ref"
+else
+    printf '%s\n' "$commit_sha" > .git/HEAD
+fi
+
+printf '[%s %s] %s\n' "$branch" "${commit_sha:0:7}" "$COMMIT_MESSAGE"
+printf '%d file(s) committed\n' "${#FILES[@]}"
 ```
-
-Show the number of files that differ from the parent (or all files if first commit).
-
-## Handling first commit (no parent)
-
-When `PARENT_SHA` is empty, omit the `parent` line entirely from the commit object. The tree is still required.
-
-## Files specified by user
-
-If the user said "commit only `src/` and `README.md`", use only those paths. Build blobs only for those files, and build a tree that mirrors only that subset. For partial commits, be sure to merge with the parent tree to avoid losing other files — read the parent tree, update only the specified entries, and write the new tree.

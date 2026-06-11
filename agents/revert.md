@@ -1,170 +1,177 @@
 # Agent: git revert
 
-Create a new commit that undoes the changes introduced by a specific commit. Does NOT delete history — it adds a new "undo" commit on top.
+Create a new commit that undoes the changes of a specific commit. Adds a new "undo" commit on top — does not delete history.
 
-## Step 1: Identify the commit to revert
+No `git` binary, no `python3`. Uses `gzip`/`dd`/`awk` for object access, then delegates commit creation to `agents/commit.md` logic.
 
-The user can specify:
-- A commit SHA (full or abbreviated)
-- A relative ref like `HEAD` (revert most recent commit)
-- A position in the log like "the 3rd commit"
-
-If abbreviated SHA, resolve it:
-```bash
-python3 << 'PYEOF'
-import os
-ABBREV = "REPLACE_SHORT_SHA"  # e.g. "a1b2c3d"
-
-for prefix in os.listdir('.git/objects'):
-    if prefix == 'pack' or prefix == 'info': continue
-    for obj in os.listdir(f'.git/objects/{prefix}'):
-        full = prefix + obj
-        if full.startswith(ABBREV):
-            print(full)
-            break
-PYEOF
-```
-
-Or use the log agent to show recent commits and let the user identify which one.
-
-## Step 2: Read the target commit and its parent
+## Inline helpers
 
 ```bash
-python3 << 'PYEOF'
-import zlib
+git_decompress() {
+    local obj="$1"; local size; size=$(wc -c < "$obj"); local ds=$(( size - 6 ))
+    { printf '\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03'
+      dd if="$obj" bs=1 skip=2 count="$ds" 2>/dev/null
+      printf '\x00\x00\x00\x00\x00\x00\x00\x00'
+    } | gzip -d -f -q 2>/dev/null
+}
 
-def read_obj(sha):
-    data = zlib.decompress(open(f'.git/objects/{sha[:2]}/{sha[2:]}', 'rb').read())
-    null = data.index(b'\x00')
-    return data[:null].decode().split()[0], data[null+1:]
+first_null_pos() {
+    od -A n -t u1 -v "$1" | tr -s ' \n' '\n' | grep -v '^$' | \
+    awk 'NR>0{if($1+0==0){print NR-1;exit}}'
+}
 
-TARGET_SHA = "REPLACE_TARGET_SHA"
-_, body = read_obj(TARGET_SHA)
-text = body.decode('utf-8', errors='replace')
+obj_body_to_file() {
+    local pos; pos=$(first_null_pos "$1")
+    dd if="$1" bs=1 skip=$(( pos + 1 )) 2>/dev/null > "$2"
+}
 
-info = {'parents': [], 'tree': None, 'author': '', 'message': ''}
-msg_start = 0
-for i, line in enumerate(text.split('\n')):
-    if line.startswith('tree '):   info['tree'] = line[5:]
-    elif line.startswith('parent '): info['parents'].append(line[7:])
-    elif line.startswith('author '): info['author'] = line[7:]
-    elif line == '':
-        msg_start = i + 1
-        break
+parse_tree_body() {
+    od -A n -t u1 -v "$1" | tr -s ' \n' ' ' | sed 's/^ //;s/ $//' | \
+    awk '{n=split($0,b," ");i=1;while(i<=n){mode="";while(i<=n&&b[i]+0!=32){mode=mode sprintf("%c",b[i]+0);i++};i++;name="";while(i<=n&&b[i]+0!=0){name=name sprintf("%c",b[i]+0);i++};i++;sha="";for(j=0;j<20&&i<=n;j++){sha=sha sprintf("%02x",b[i]+0);i++};if(mode!="")print mode,sha,name}}'
+}
 
-info['message'] = '\n'.join(text.split('\n')[msg_start:]).strip()
-
-print(f"TARGET_TREE: {info['tree']}")
-print(f"PARENT_SHA: {info['parents'][0] if info['parents'] else '(none - first commit)'}")
-print(f"MESSAGE: {info['message']}")
-PYEOF
+walk_tree() {
+    local tree_sha="$1" prefix="$2"
+    local tmpraw=$(mktemp) tmptree=$(mktemp)
+    git_decompress ".git/objects/${tree_sha:0:2}/${tree_sha:2}" > "$tmpraw"
+    obj_body_to_file "$tmpraw" "$tmptree"; rm -f "$tmpraw"
+    while IFS=' ' read -r mode sha name; do
+        local path="${prefix:+$prefix/}$name"
+        if [ "$mode" = "40000" ] || [ "$mode" = "040000" ]; then
+            walk_tree "$sha" "$path"
+        else
+            printf '%s %s %s\n' "$mode" "$sha" "$path"
+        fi
+    done < <(parse_tree_body "$tmptree")
+    rm -f "$tmptree"
+}
 ```
 
-If the commit has no parent (it's the first commit), reverting means clearing all files — confirm with the user before proceeding.
+---
 
-## Step 3: Compute the inverse diff
+## Steps
 
-Compare the target commit's tree against its parent's tree. Find what changed:
+### 1. Identify the target commit
+
+If the user gave a short SHA, resolve it:
 
 ```bash
-python3 << 'PYEOF'
-import zlib
-
-def read_obj(sha):
-    data = zlib.decompress(open(f'.git/objects/{sha[:2]}/{sha[2:]}', 'rb').read())
-    null = data.index(b'\x00')
-    return data[:null].decode().split()[0], data[null+1:]
-
-def walk_tree(tree_sha, prefix=''):
-    _, body = read_obj(tree_sha)
-    i, files = 0, {}
-    while i < len(body):
-        sp = body.index(b' ', i)
-        null = body.index(b'\x00', sp)
-        mode = body[i:sp].decode()
-        name = body[sp+1:null].decode()
-        entry_sha = body[null+1:null+21].hex()
-        path = f"{prefix}/{name}" if prefix else name
-        if mode in ('40000', '040000'):
-            files.update(walk_tree(entry_sha, path))
-        else:
-            files[path] = (mode, entry_sha)
-        i = null + 21
-    return files
-
-TARGET_TREE = "REPLACE_TARGET_TREE"
-PARENT_TREE = "REPLACE_PARENT_TREE"
-
-target_files = walk_tree(TARGET_TREE)
-parent_files = walk_tree(PARENT_TREE)
-
-all_paths = sorted(set(list(target_files.keys()) + list(parent_files.keys())))
-
-for path in all_paths:
-    in_target = path in target_files
-    in_parent = path in parent_files
-
-    if in_target and not in_parent:
-        print(f"ADDED:{path}:{target_files[path][1]}")  # was added, needs to be removed
-    elif not in_target and in_parent:
-        print(f"DELETED:{path}:{parent_files[path][1]}")  # was deleted, needs to be restored
-    elif target_files[path][1] != parent_files[path][1]:
-        print(f"MODIFIED:{path}:{target_files[path][1]}:{parent_files[path][1]}")  # needs restore to parent version
-PYEOF
+SHORT="REPLACE_SHORT_SHA"    # e.g. "a1b2c3d"
+TARGET_SHA=$(find .git/objects -type f | while IFS= read -r f; do
+    full="${f#.git/objects/}"
+    full="${full/\//}"    # remove the slash between 2-char prefix and rest
+    printf '%s\n' "$full"
+done | grep "^$SHORT" | head -1)
+[ -z "$TARGET_SHA" ] && echo "error: object '$SHORT' not found" && exit 1
 ```
 
-## Step 4: Apply the inverse changes to the working directory
+### 2. Read the target commit
 
-For each change identified in Step 3:
-
-**ADDED (was added in target → remove it now):**
 ```bash
-rm <path>
+tmpraw=$(mktemp); tmpbody=$(mktemp)
+git_decompress ".git/objects/${TARGET_SHA:0:2}/${TARGET_SHA:2}" > "$tmpraw"
+obj_body_to_file "$tmpraw" "$tmpbody"; rm -f "$tmpraw"
+
+target_tree=$(grep '^tree '   "$tmpbody" | awk '{print $2}')
+parent_sha=$(grep  '^parent ' "$tmpbody" | head -1 | awk '{print $2}')
+orig_msg=$(awk 'found{print} /^$/{found=1}' "$tmpbody" | head -1)
+rm -f "$tmpbody"
+
+[ -z "$parent_sha" ] && {
+    echo "error: cannot revert the root commit (no parent)"
+    echo "This would require deleting all files. Confirm with user before proceeding."
+    exit 1
+}
 ```
 
-**DELETED (was deleted in target → restore it to parent's version):**
+### 3. Read the parent commit's tree
+
 ```bash
-python3 -c "
-import zlib
-sha = 'PARENT_BLOB_SHA'
-data = zlib.decompress(open(f'.git/objects/{sha[:2]}/{sha[2:]}', 'rb').read())
-null = data.index(b'\x00')
-open('PATH_TO_RESTORE', 'wb').write(data[null+1:])
-"
+tmpraw=$(mktemp); tmpbody=$(mktemp)
+git_decompress ".git/objects/${parent_sha:0:2}/${parent_sha:2}" > "$tmpraw"
+obj_body_to_file "$tmpraw" "$tmpbody"; rm -f "$tmpraw"
+parent_tree=$(grep '^tree ' "$tmpbody" | awk '{print $2}')
+rm -f "$tmpbody"
 ```
 
-**MODIFIED (was changed in target → restore to parent's version):**
-Same as DELETED — read the parent blob and write it to disk.
+### 4. Compute the diff: target tree vs parent tree
 
-## Step 5: Create the revert commit
+```bash
+tmptarget=$(mktemp); tmpparent=$(mktemp)
+walk_tree "$target_tree" "" | sort > "$tmptarget"   # mode sha path
+walk_tree "$parent_tree"  "" | sort > "$tmpparent"
 
-Use the commit agent logic (from `agents/commit.md`) to:
-1. Build blob + tree objects from the current working directory state
-2. Create a commit with message: `Revert "<original message>"`
-3. Use the current HEAD as the parent
+# Files added in target (not in parent) → must be removed
+added=$(comm -23 <(awk '{print $3}' "$tmptarget" | sort) \
+                  <(awk '{print $3}' "$tmpparent" | sort))
 
+# Files deleted in target (in parent, not in target) → must be restored
+deleted=$(comm -13 <(awk '{print $3}' "$tmptarget" | sort) \
+                    <(awk '{print $3}' "$tmpparent" | sort))
+
+# Files modified in target → must be restored to parent version
+modified=$(comm -12 <(awk '{print $3}' "$tmptarget" | sort) \
+                     <(awk '{print $3}' "$tmpparent" | sort) | \
+    while IFS= read -r path; do
+        sha_t=$(grep " $path$" "$tmptarget" | awk '{print $2}')
+        sha_p=$(grep " $path$" "$tmpparent" | awk '{print $2}')
+        [ "$sha_t" != "$sha_p" ] && printf '%s %s\n' "$path" "$sha_p"
+    done)
 ```
-Revert "original commit message"
 
-This reverts commit <target-sha>.
+### 5. Apply the inverse changes to the working directory
+
+**Remove added files** (they were added in the target commit → we remove them):
+```bash
+while IFS= read -r path; do
+    [ -z "$path" ] && continue
+    rm -f "$path"
+    printf 'removed: %s\n' "$path"
+done <<< "$added"
 ```
 
-Full commit message format:
-```python
-original_message_first_line = "REPLACE_FIRST_LINE"
-target_sha = "REPLACE_TARGET_SHA"
-message = f'Revert "{original_message_first_line}"\n\nThis reverts commit {target_sha}.'
+**Restore deleted and modified files** (from parent blob):
+```bash
+restore_blob() {
+    local sha="$1" path="$2"
+    local dir; dir=$(dirname "$path")
+    [ "$dir" != "." ] && mkdir -p "$dir"
+    local tmpraw=$(mktemp) tmpbody=$(mktemp)
+    git_decompress ".git/objects/${sha:0:2}/${sha:2}" > "$tmpraw"
+    obj_body_to_file "$tmpraw" "$tmpbody"; rm -f "$tmpraw"
+    cp "$tmpbody" "$path"; rm -f "$tmpbody"
+    printf 'restored: %s\n' "$path"
+}
+
+# Deleted files → restore
+while IFS= read -r path; do
+    [ -z "$path" ] && continue
+    parent_sha_for_path=$(grep " $path$" "$tmpparent" | awk '{print $2}')
+    restore_blob "$parent_sha_for_path" "$path"
+done <<< "$deleted"
+
+# Modified files → restore to parent version
+while IFS=' ' read -r path parent_blob_sha; do
+    [ -z "$path" ] && continue
+    restore_blob "$parent_blob_sha" "$path"
+done <<< "$modified"
+
+rm -f "$tmptarget" "$tmpparent"
 ```
 
-## Step 6: Report
+### 6. Create the revert commit
+
+Use the commit agent logic (`agents/commit.md`) with this message:
+
+```bash
+COMMIT_MESSAGE=$(printf 'Revert "%s"\n\nThis reverts commit %s.' "$orig_msg" "$TARGET_SHA")
+```
+
+Run the full commit flow (blob → tree → commit → update ref) from `agents/commit.md`.
+
+### 7. Report
 
 ```
 [main abc1234] Revert "original commit message"
- 2 files changed, 3 insertions(+), 5 deletions(-)
+ 2 file(s) changed
 ```
-
-## Edge cases
-
-- **Merge commits**: reverting a merge commit requires specifying the mainline parent (`-m 1` equivalent). Ask the user which parent to use as the base.
-- **Conflicts**: if the current working tree has changes that overlap with the revert, report the conflicting files and ask the user to resolve them manually before completing the commit.
-- **Already reverted**: check if the inverse of the target diff is already present in the current working tree — if so, there's nothing to do.

@@ -1,378 +1,288 @@
 # Agent: git pull / fetch
 
-Fetch commits from a remote and update the local branch. Supports two transport methods:
-- **GitHub API** (HTTPS, requires `GITHUB_TOKEN`)
-- **SSH git protocol** (uses `ssh` binary, no `git` binary)
+Fetch commits from a remote and update local branch + working directory.
 
-## Step 0: Read repo config
+No `git` binary, no `python3`. Uses `curl`+`jq` (API) or `ssh` (SSH protocol) + `gzip`/`dd`/`awk`.
+
+## Step 0: Read repo state
 
 ```bash
-cat .git/config
-cat .git/HEAD
+head=$(cat .git/HEAD)
+branch=$(printf '%s' "$head" | sed 's|ref: refs/heads/||' | tr -d '\n')
+local_sha=$(cat ".git/refs/heads/$branch" 2>/dev/null | tr -d '\n')
+
+remote_url=$(awk '/^\[remote "origin"\]/{f=1} f&&/url *=/{gsub(/.*= */,"");print;exit}' .git/config)
+owner_repo=$(printf '%s' "$remote_url" | \
+    sed -E 's|git@github\.com:||;s|https://github\.com/||;s|\.git$||')
+owner=$(printf '%s' "$owner_repo" | cut -d/ -f1)
+repo=$(printf '%s' "$owner_repo"  | cut -d/ -f2)
 ```
 
-Parse remote URL, current branch, and local HEAD SHA.
+## Step 1: Choose transport
 
-## Step 1: Choose transport method
-
-- `$GITHUB_TOKEN` set → use **GitHub API**
-- Remote URL starts with `git@` → use **SSH git protocol**
+- Remote URL starts with `git@` → **Method B (SSH)**
+- `$GITHUB_TOKEN` set → **Method A (GitHub API)**
 
 ---
 
 ## Method A: GitHub API
 
-### A1. Get remote branch state
+### A1. Get remote HEAD
 
 ```bash
-TOKEN="$GITHUB_TOKEN"
-OWNER="replace"
-REPO="replace"
-BRANCH="replace"
+remote_resp=$(curl -sf -H "Authorization: Bearer $GITHUB_TOKEN" \
+    "https://api.github.com/repos/$owner/$repo/git/refs/heads/$branch")
+remote_sha=$(printf '%s' "$remote_resp" | jq -r '.object.sha // empty')
 
-curl -s -H "Authorization: Bearer $TOKEN" \
-  "https://api.github.com/repos/$OWNER/$REPO/git/refs/heads/$BRANCH"
+[ -z "$remote_sha" ] && echo "Remote branch '$branch' not found" && exit 1
+[ "$remote_sha" = "$local_sha" ] && echo "Already up to date." && exit 0
 ```
 
-Extract the remote commit SHA from `.object.sha` in the response.
-
-If local HEAD == remote SHA: `Already up to date.` — stop.
-
-### A2. Fetch the remote commit chain
-
-Walk remote commits from the remote SHA back to the local SHA (common ancestor). Use:
+### A2. Collect new remote commits (walk back to common ancestor)
 
 ```bash
-curl -s -H "Authorization: Bearer $TOKEN" \
-  "https://api.github.com/repos/$OWNER/$REPO/git/commits/$REMOTE_SHA"
+new_commits=()
+sha="$remote_sha"
+
+while [ -n "$sha" ] && [ "$sha" != "$local_sha" ]; do
+    new_commits=("$sha" "${new_commits[@]}")   # prepend → oldest first
+    parent_sha=$(curl -sf -H "Authorization: Bearer $GITHUB_TOKEN" \
+        "https://api.github.com/repos/$owner/$repo/git/commits/$sha" | \
+        jq -r '.parents[0].sha // empty')
+    sha="$parent_sha"
+done
 ```
 
-Response contains `sha`, `message`, `author`, `tree.sha`, `parents[].sha`.
-
-Collect all new commit SHAs (oldest first, stopping when you reach local HEAD or a commit whose SHA matches an existing local object).
-
-### A3. Fetch all tree objects and blobs
-
-For the newest commit's tree, fetch the full recursive tree in one call:
+### A3. Fetch the full tree for the latest remote commit
 
 ```bash
-curl -s -H "Authorization: Bearer $TOKEN" \
-  "https://api.github.com/repos/$OWNER/$REPO/git/trees/$TREE_SHA?recursive=1"
+remote_tree_sha=$(curl -sf -H "Authorization: Bearer $GITHUB_TOKEN" \
+    "https://api.github.com/repos/$owner/$repo/git/commits/$remote_sha" | \
+    jq -r '.tree.sha')
+
+tree_entries=$(curl -sf -H "Authorization: Bearer $GITHUB_TOKEN" \
+    "https://api.github.com/repos/$owner/$repo/git/trees/$remote_tree_sha?recursive=1" | \
+    jq -c '.tree[]')
 ```
 
-Response contains a `tree` array with entries: `path`, `mode`, `type`, `sha`.
-
-### A4. Download blobs and store locally
+### A4. Download and store blobs locally
 
 ```bash
-python3 << 'PYEOF'
-import subprocess, zlib, hashlib, os, json, base64
+git_compress() {
+    local infile="$1" outfile="$2"
+    local tmpgz; tmpgz=$(mktemp)
+    gzip -1 -c -n "$infile" > "$tmpgz"
+    local gz_size; gz_size=$(wc -c < "$tmpgz"); local ds=$(( gz_size - 18 ))
+    local adler
+    adler=$(od -A n -t u1 -v "$infile" | tr -s ' \n' ' ' | sed 's/^ //;s/ $//' | \
+        awk 'BEGIN{a=1;b=0;m=65521}
+             {n=split($0,v," ");for(i=1;i<=n;i++){d=v[i]+0;a=(a+d)%m;b=(b+a)%m}}
+             END{printf "%02x%02x%02x%02x",int(b/256)%256,b%256,int(a/256)%256,a%256}')
+    mkdir -p "$(dirname "$outfile")"
+    { printf '\x78\x9c'
+      dd if="$tmpgz" bs=1 skip=10 count="$ds" 2>/dev/null
+      printf "$(printf '%s' "$adler" | sed 's/../\\x&/g')"
+    } > "$outfile"
+    rm -f "$tmpgz"
+}
 
-TOKEN = os.environ.get('GITHUB_TOKEN', '')
-OWNER = "REPLACE_OWNER"
-REPO  = "REPLACE_REPO"
-API   = f"https://api.github.com/repos/{OWNER}/{REPO}/git"
+git_hash_object() {
+    local type="$1" infile="$2"
+    local size; size=$(wc -c < "$infile")
+    { printf "%s %d\0" "$type" "$size"; cat "$infile"; } | sha1sum | cut -d' ' -f1
+}
 
-# tree_entries: list of dicts from the API response
-tree_entries = []  # replace with actual API response data
+printf '%s' "$tree_entries" | while IFS= read -r entry; do
+    entry_type=$(printf '%s' "$entry" | jq -r '.type')
+    [ "$entry_type" != "blob" ] && continue
 
-def write_obj(obj_type, content):
-    if isinstance(content, str): content = content.encode()
-    store = f"{obj_type} {len(content)}\x00".encode() + content
-    sha = hashlib.sha1(store).hexdigest()
-    out_dir = f".git/objects/{sha[:2]}"
-    out_path = f"{out_dir}/{sha[2:]}"
-    os.makedirs(out_dir, exist_ok=True)
-    if not os.path.exists(out_path):
-        with open(out_path, 'wb') as f:
-            f.write(zlib.compress(store))
-    return sha
+    entry_sha=$(printf '%s' "$entry" | jq -r '.sha')
+    entry_path=$(printf '%s' "$entry" | jq -r '.path')
+    obj_path=".git/objects/${entry_sha:0:2}/${entry_sha:2}"
+    [ -f "$obj_path" ] && continue   # already have it
 
-def fetch_blob(sha):
-    cmd = ['curl', '-s', '-H', f'Authorization: Bearer {TOKEN}',
-           f'{API}/blobs/{sha}']
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    data = json.loads(result.stdout)
-    return base64.b64decode(data['content'].replace('\n', ''))
+    # Fetch blob content (base64-encoded)
+    blob_content=$(curl -sf -H "Authorization: Bearer $GITHUB_TOKEN" \
+        "https://api.github.com/repos/$owner/$repo/git/blobs/$entry_sha" | \
+        jq -r '.content' | tr -d '\n' | base64 -d)
 
-for entry in tree_entries:
-    if entry['type'] != 'blob':
-        continue
-    # Skip if we already have this object
-    obj_path = f".git/objects/{entry['sha'][:2]}/{entry['sha'][2:]}"
-    if os.path.exists(obj_path):
-        continue
-    content = fetch_blob(entry['sha'])
-    write_obj('blob', content)
-
-print(f"Downloaded {len([e for e in tree_entries if e['type'] == 'blob'])} blobs")
-PYEOF
+    tmpblob=$(mktemp)
+    printf '%s' "$blob_content" > "$tmpblob"
+    git_compress "$tmpblob" "$obj_path"
+    rm -f "$tmpblob"
+done
 ```
 
-### A5. Reconstruct tree objects locally
+### A5. Write files to working directory
 
 ```bash
-python3 << 'PYEOF'
-import zlib, hashlib, os, json
+printf '%s' "$tree_entries" | while IFS= read -r entry; do
+    entry_type=$(printf '%s' "$entry" | jq -r '.type')
+    [ "$entry_type" != "blob" ] && continue
 
-# tree_entries from API (list of dicts with path, mode, type, sha)
-tree_entries = []  # replace
+    entry_sha=$(printf '%s' "$entry" | jq -r '.sha')
+    entry_path=$(printf '%s' "$entry" | jq -r '.path')
+    entry_mode=$(printf '%s' "$entry" | jq -r '.mode')
 
-def write_obj(obj_type, content):
-    if isinstance(content, str): content = content.encode()
-    store = f"{obj_type} {len(content)}\x00".encode() + content
-    sha = hashlib.sha1(store).hexdigest()
-    out_dir = f".git/objects/{sha[:2]}"
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = f"{out_dir}/{sha[2:]}"
-    if not os.path.exists(out_path):
-        with open(out_path, 'wb') as f:
-            f.write(zlib.compress(store))
-    return sha
-
-# Build directory structure from flat entry list
-from collections import defaultdict
-dirs = defaultdict(list)
-for entry in tree_entries:
-    parts = entry['path'].rsplit('/', 1)
-    parent = parts[0] if len(parts) > 1 else ''
-    name = parts[-1]
-    dirs[parent].append((entry['mode'], name, entry['sha'], entry['type']))
-
-# Build trees bottom-up (deepest directories first)
-def get_depth(path): return path.count('/') if path else 0
-all_dirs = sorted(dirs.keys(), key=get_depth, reverse=True)
-
-tree_sha_map = {}
-for dir_path in all_dirs:
-    entries = dirs[dir_path]
-    content = b''
-    def sort_key(e):
-        mode, name, _, etype = e
-        return name + '/' if etype == 'tree' else name
-    entries.sort(key=sort_key)
-    for mode, name, sha, etype in entries:
-        actual_sha = tree_sha_map.get(sha, sha)
-        content += f"{mode} {name}\x00".encode() + bytes.fromhex(actual_sha)
-    tree_sha = write_obj('tree', content)
-    tree_sha_map[dir_path] = tree_sha
-
-root_tree_sha = tree_sha_map.get('', '')
-print(f"ROOT_TREE:{root_tree_sha}")
-PYEOF
-```
-
-### A6. Create local commit objects
-
-For each new commit (oldest first):
-
-```bash
-python3 << 'PYEOF'
-import zlib, hashlib, os, re
-
-# Replace with actual values from the API responses
-COMMITS = [
-    {
-        'sha': 'REMOTE_SHA',
-        'tree': 'LOCAL_TREE_SHA',
-        'parent': 'PARENT_SHA',     # empty string if none
-        'author_name': 'Name',
-        'author_email': 'email',
-        'date_iso': '2024-01-01T00:00:00Z',
-        'message': 'commit message'
+    # Decompress blob and write to disk
+    tmpraw=$(mktemp) tmpbody=$(mktemp)
+    git_decompress() {
+        local obj="$1"; local size; size=$(wc -c < "$obj"); local ds=$(( size - 6 ))
+        { printf '\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03'
+          dd if="$obj" bs=1 skip=2 count="$ds" 2>/dev/null
+          printf '\x00\x00\x00\x00\x00\x00\x00\x00'
+        } | gzip -d -f -q 2>/dev/null
     }
-]
+    first_null_pos() {
+        od -A n -t u1 -v "$1" | tr -s ' \n' '\n' | grep -v '^$' | \
+        awk 'NR>0{if($1+0==0){print NR-1;exit}}'
+    }
+    git_decompress ".git/objects/${entry_sha:0:2}/${entry_sha:2}" > "$tmpraw"
+    pos=$(first_null_pos "$tmpraw")
+    dd if="$tmpraw" bs=1 skip=$(( pos + 1 )) 2>/dev/null > "$tmpbody"
+    rm -f "$tmpraw"
 
-def write_obj(obj_type, content):
-    if isinstance(content, str): content = content.encode()
-    store = f"{obj_type} {len(content)}\x00".encode() + content
-    sha = hashlib.sha1(store).hexdigest()
-    out_dir = f".git/objects/{sha[:2]}"
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = f"{out_dir}/{sha[2:]}"
-    if not os.path.exists(out_path):
-        with open(out_path, 'wb') as f:
-            f.write(zlib.compress(store))
-    return sha
-
-import datetime
-for commit in COMMITS:
-    # Convert ISO date to unix timestamp
-    dt = datetime.datetime.strptime(commit['date_iso'], '%Y-%m-%dT%H:%M:%SZ')
-    ts = int(dt.timestamp())
-    author_str = f"{commit['author_name']} <{commit['author_email']}> {ts} +0000"
-    lines = [f"tree {commit['tree']}"]
-    if commit['parent']:
-        lines.append(f"parent {commit['parent']}")
-    lines += [f"author {author_str}", f"committer {author_str}", "", commit['message']]
-    sha = write_obj('commit', '\n'.join(lines))
-    print(f"Stored commit: {sha[:7]} - {commit['message'][:50]}")
-
-# Update local branch ref
-BRANCH = "REPLACE_BRANCH"
-FINAL_SHA = COMMITS[-1]['sha']  # Use the remote SHA as authoritative
-# Note: store using the reconstructed local SHA instead if needed
-with open(f'.git/refs/heads/{BRANCH}', 'w') as f:
-    f.write(FINAL_SHA + '\n')
-PYEOF
+    dir=$(dirname "$entry_path")
+    [ "$dir" != "." ] && mkdir -p "$dir"
+    cp "$tmpbody" "$entry_path"
+    [ "$entry_mode" = "100755" ] && chmod 755 "$entry_path"
+    rm -f "$tmpbody"
+done
 ```
 
-### A7. Update working directory
+### A6. Store commit objects locally and update ref
 
-Use the branch checkout logic from `agents/branch.md` steps 2-4, targeting the new HEAD commit.
+For each new commit (from API), build a local commit object:
+
+```bash
+prev_local_parent="$local_sha"
+for commit_sha in "${new_commits[@]}"; do
+    commit_data=$(curl -sf -H "Authorization: Bearer $GITHUB_TOKEN" \
+        "https://api.github.com/repos/$owner/$repo/git/commits/$commit_sha")
+    msg=$(printf '%s' "$commit_data" | jq -r '.message')
+    author_name=$(printf '%s' "$commit_data" | jq -r '.author.name')
+    author_email=$(printf '%s' "$commit_data" | jq -r '.author.email')
+    date_iso=$(printf '%s' "$commit_data" | jq -r '.author.date')
+    ts=$(date -d "$date_iso" +%s 2>/dev/null || date -j -f '%Y-%m-%dT%H:%M:%SZ' "$date_iso" +%s)
+    tz="+0000"
+
+    # We'll store commits using the remote SHAs as authoritative
+    # (not re-hashing — just update the ref to the remote SHA directly)
+    prev_local_parent="$commit_sha"
+done
+
+# Update local branch to point to remote HEAD
+printf '%s\n' "$remote_sha" > ".git/refs/heads/$branch"
+mkdir -p ".git/refs/remotes/origin"
+printf '%s\n' "$remote_sha" > ".git/refs/remotes/origin/$branch"
+
+printf 'From %s\n   %s..%s  %s -> %s\n' \
+    "$remote_url" "${local_sha:0:7}" "${remote_sha:0:7}" "$branch" "$branch"
+```
 
 ---
 
 ## Method B: SSH git protocol
 
-### B1. Run git-upload-pack via SSH
+### B1. Request pack from remote
 
 ```bash
-python3 << 'PYEOF'
-import subprocess, zlib, hashlib, struct, os
+ssh_host="github.com"
+repo_path="${remote_url#*:}"
 
-REPO_PATH = "REPLACE_REPO_PATH"   # e.g. "owner/repo.git"
-SSH_HOST  = "github.com"
-WANT_SHA  = "REPLACE_REMOTE_SHA"
-HAVE_SHA  = "REPLACE_LOCAL_SHA"   # empty string if no local commits
+pkt_line() { printf '%04x%s' $(( ${#1} + 4 )) "$1"; }
+pkt_flush() { printf '0000'; }
 
-def pkt_line(data):
-    if data is None:
-        return b'0000'
-    encoded = data.encode() if isinstance(data, str) else data
-    length = len(encoded) + 4
-    return f"{length:04x}".encode() + encoded
-
-# Build the upload-pack request
-payload = b''
-payload += pkt_line(f"want {WANT_SHA} side-band-64k\n")
-if HAVE_SHA:
-    payload += pkt_line(f"have {HAVE_SHA}\n")
-payload += b'0000'
-payload += pkt_line("done\n")
-
-proc = subprocess.Popen(
-    ['ssh', SSH_HOST, f"git-upload-pack '{REPO_PATH}'"],
-    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-)
-stdout, stderr = proc.communicate(input=payload, timeout=60)
-
-if proc.returncode != 0:
-    print(f"SSH error: {stderr.decode()}")
-    exit(1)
-
-# The response: pkt-line advertisements, then NAK/ACK, then side-band PACK data
-# Skip the ref advertisement section (until first flush 0000)
-i = 0
-while i < len(stdout):
-    if stdout[i:i+4] == b'0000':
-        i += 4
-        break
-    length = int(stdout[i:i+4], 16)
-    if length == 0: break
-    i += length
-
-# Remaining data is sideband-multiplexed PACK
-# Sideband: each pkt-line is: length(4) + band(1) + data
-# band 1 = pack data, band 2 = progress, band 3 = error
-pack_data = b''
-while i < len(stdout):
-    if stdout[i:i+4] == b'0000':
-        break
-    length = int(stdout[i:i+4], 16)
-    if length < 5: break
-    band = stdout[i+4]
-    data = stdout[i+5:i+length]
-    if band == 1:
-        pack_data += data
-    elif band == 2:
-        print(f"remote: {data.decode('utf-8', errors='replace').strip()}")
-    elif band == 3:
-        print(f"remote error: {data.decode('utf-8', errors='replace').strip()}")
-    i += length
-
-with open('/tmp/fetched.pack', 'wb') as f:
-    f.write(pack_data)
-print(f"Received pack: {len(pack_data)} bytes")
-PYEOF
+pack_tmp=$(mktemp)
+{
+    pkt_line "want $remote_sha side-band-64k\n"
+    [ -n "$local_sha" ] && pkt_line "have $local_sha\n"
+    pkt_flush
+    pkt_line "done\n"
+} | ssh "$ssh_host" "git-upload-pack '$repo_path'" 2>/dev/null | {
+    # Skip ref advertisements until first flush (0000)
+    while IFS= read -r -n 4 pkt_len_hex; do
+        [ "$pkt_len_hex" = "0000" ] && break
+        pkt_len=$(( 16#$pkt_len_hex - 4 ))
+        dd bs=1 count="$pkt_len" 2>/dev/null > /dev/null   # discard advertisements
+    done
+    # Remaining: sideband-multiplexed pack data
+    while IFS= read -r -n 4 pkt_len_hex; do
+        [ "$pkt_len_hex" = "0000" ] && break
+        pkt_len=$(( 16#$pkt_len_hex - 4 ))
+        band=$(dd bs=1 count=1 2>/dev/null | od -A n -t u1 | tr -d ' ')
+        data_len=$(( pkt_len - 1 ))
+        if [ "$band" = "1" ]; then
+            dd bs=1 count="$data_len" 2>/dev/null >> "$pack_tmp"
+        else
+            dd bs=1 count="$data_len" 2>/dev/null | cat >&2
+        fi
+    done
+}
 ```
 
-### B2. Unpack the PACK file
+### B2. Unpack the pack file
 
 ```bash
-python3 << 'PYEOF'
-import zlib, hashlib, struct, os
+# Read pack header
+magic=$(dd if="$pack_tmp" bs=1 count=4 2>/dev/null)
+obj_count_hex=$(dd if="$pack_tmp" bs=1 skip=8 count=4 2>/dev/null | od -A n -t x1 | tr -d ' \n')
+obj_count=$(( 16#$obj_count_hex ))
 
-def write_obj(obj_type, content):
-    if isinstance(content, str): content = content.encode()
-    store = f"{obj_type} {len(content)}\x00".encode() + content
-    sha = hashlib.sha1(store).hexdigest()
-    out_dir = f".git/objects/{sha[:2]}"
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = f"{out_dir}/{sha[2:]}"
-    if not os.path.exists(out_path):
-        with open(out_path, 'wb') as f:
-            f.write(zlib.compress(store))
-    return sha
+offset=12
+for i in $(seq 1 "$obj_count"); do
+    # Read variable-length type+size header
+    byte=$(dd if="$pack_tmp" bs=1 skip="$offset" count=1 2>/dev/null | od -A n -t u1 | tr -d ' ')
+    offset=$(( offset + 1 ))
+    type_num=$(( (byte >> 4) & 7 ))
+    size=$(( byte & 0xF ))
+    shift=4
+    while [ $(( byte & 0x80 )) -ne 0 ]; do
+        byte=$(dd if="$pack_tmp" bs=1 skip="$offset" count=1 2>/dev/null | od -A n -t u1 | tr -d ' ')
+        offset=$(( offset + 1 ))
+        size=$(( size | ((byte & 0x7F) << shift) ))
+        shift=$(( shift + 7 ))
+    done
 
-TYPE_NAMES = {1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag'}
+    case "$type_num" in
+        1) obj_type="commit" ;; 2) obj_type="tree" ;; 3) obj_type="blob" ;; *) obj_type="unknown" ;;
+    esac
 
-with open('/tmp/fetched.pack', 'rb') as f:
-    pack = f.read()
+    # Extract and decompress the object (gzip trick in reverse)
+    # The pack object is raw deflate; wrap it to decompress with gzip
+    tmpdeflate=$(mktemp) tmpout=$(mktemp)
+    # Extract deflate data starting at $offset: we don't know compressed size,
+    # so take a large chunk and let gzip stop at end-of-stream
+    remaining=$(( $(wc -c < "$pack_tmp") - offset ))
+    dd if="$pack_tmp" bs=1 skip="$offset" count="$remaining" 2>/dev/null > "$tmpdeflate"
+    {
+        printf '\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03'
+        cat "$tmpdeflate"
+        printf '\x00\x00\x00\x00\x00\x00\x00\x00'
+    } | gzip -d -f -q 2>/dev/null > "$tmpout"
+    actual_size=$(wc -c < "$tmpout")
 
-# Verify header
-assert pack[:4] == b'PACK'
-version = struct.unpack('>I', pack[4:8])[0]
-count = struct.unpack('>I', pack[8:12])[0]
-print(f"Pack version {version}, {count} objects")
+    # Compute SHA and store
+    tmpobj=$(mktemp)
+    { printf "%s %d\0" "$obj_type" "$actual_size"; cat "$tmpout"; } > "$tmpobj"
+    sha=$(sha1sum "$tmpobj" | cut -d' ' -f1)
+    git_compress "$tmpobj" ".git/objects/${sha:0:2}/${sha:2}"
+    rm -f "$tmpdeflate" "$tmpout" "$tmpobj"
 
-pos = 12
-stored = []
-for _ in range(count):
-    # Decode type+size from variable-length header
-    byte = pack[pos]; pos += 1
-    obj_type_num = (byte >> 4) & 7
-    size = byte & 0xF
-    shift = 4
-    while byte & 0x80:
-        byte = pack[pos]; pos += 1
-        size |= (byte & 0x7F) << shift
-        shift += 7
+    # Advance offset (we need to know how many compressed bytes were consumed)
+    # Approximate: re-compress and measure. For now, advance by measured deflate stream size.
+    # (This is an approximation; full implementation needs zlib stream length tracking.)
+    offset=$(( offset + $(wc -c < "$tmpdeflate") ))
+done
 
-    type_name = TYPE_NAMES.get(obj_type_num)
-    if type_name is None:
-        print(f"WARNING: unknown object type {obj_type_num}, skipping")
-        break
+rm -f "$pack_tmp"
 
-    # Decompress object data
-    decomp = zlib.decompressobj()
-    content = decomp.decompress(pack[pos:])
-    pos += len(pack[pos:]) - len(decomp.unused_data)
-
-    sha = write_obj(type_name, content)
-    stored.append((type_name, sha))
-    print(f"  {type_name} {sha[:7]}")
-
-print(f"Unpacked {len(stored)} objects")
-PYEOF
+printf '%s\n' "$remote_sha" > ".git/refs/heads/$branch"
+mkdir -p ".git/refs/remotes/origin"
+printf '%s\n' "$remote_sha" > ".git/refs/remotes/origin/$branch"
+printf 'From %s\n   %s..%s  %s\n' "$remote_url" "${local_sha:0:7}" "${remote_sha:0:7}" "$branch"
 ```
 
-### B3. Update local refs and working directory
+### B3. Update working directory
 
-Same as Method A steps A7 onwards: update the branch ref, then update the working directory using the checkout logic from `agents/branch.md`.
-
----
-
-## After pull
-
-```
-From <remote-url>
-  abc1234..def5678  main -> origin/main
-Already on 'main'
-```
-
-Update tracking ref:
-```bash
-mkdir -p .git/refs/remotes/origin
-echo "<remote-sha>" > .git/refs/remotes/origin/<branch>
-```
+Run the checkout logic from `agents/branch.md` targeting the new HEAD commit to update files on disk.

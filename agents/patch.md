@@ -1,248 +1,192 @@
 # Agent: git patch (format-patch / diff)
 
-Create a unified diff patch file comparing two states: two commits, a commit vs its parent, or HEAD vs the working tree.
+Create a unified diff patch file. Uses the system `diff -u` binary — no python, no git binary.
 
-## Determine what to diff
+Read `references/git-internals.md` for `git_decompress`, `first_null_pos`, `parse_tree_body`.
 
-Ask the user (if not already clear):
-- **Two commits**: "diff commit A against commit B"
-- **Single commit**: "patch for commit X" (diffs X against its parent)
-- **Working tree**: "diff uncommitted changes" (compares HEAD tree vs current files on disk)
+## Inline helpers
+
+```bash
+git_decompress() {
+    local obj="$1"; local size; size=$(wc -c < "$obj"); local ds=$(( size - 6 ))
+    { printf '\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03'
+      dd if="$obj" bs=1 skip=2 count="$ds" 2>/dev/null
+      printf '\x00\x00\x00\x00\x00\x00\x00\x00'
+    } | gzip -d -f -q 2>/dev/null
+}
+
+first_null_pos() {
+    od -A n -t u1 -v "$1" | tr -s ' \n' '\n' | grep -v '^$' | \
+    awk 'NR>0{if($1+0==0){print NR-1;exit}}'
+}
+
+obj_body_to_file() {
+    local pos; pos=$(first_null_pos "$1")
+    dd if="$1" bs=1 skip=$(( pos + 1 )) 2>/dev/null > "$2"
+}
+
+parse_tree_body() {
+    od -A n -t u1 -v "$1" | tr -s ' \n' ' ' | sed 's/^ //;s/ $//' | \
+    awk '{n=split($0,b," ");i=1;while(i<=n){mode="";while(i<=n&&b[i]+0!=32){mode=mode sprintf("%c",b[i]+0);i++};i++;name="";while(i<=n&&b[i]+0!=0){name=name sprintf("%c",b[i]+0);i++};i++;sha="";for(j=0;j<20&&i<=n;j++){sha=sha sprintf("%02x",b[i]+0);i++};if(mode!="")print mode,sha,name}}'
+}
+
+# Walk a tree recursively; output: "blob_sha relative/path"
+walk_tree() {
+    local tree_sha="$1" prefix="$2"
+    local tmpraw=$(mktemp) tmptree=$(mktemp)
+    git_decompress ".git/objects/${tree_sha:0:2}/${tree_sha:2}" > "$tmpraw"
+    obj_body_to_file "$tmpraw" "$tmptree"; rm -f "$tmpraw"
+    while IFS=' ' read -r mode sha name; do
+        local path="${prefix:+$prefix/}$name"
+        if [ "$mode" = "40000" ] || [ "$mode" = "040000" ]; then
+            walk_tree "$sha" "$path"
+        else
+            printf '%s %s\n' "$sha" "$path"
+        fi
+    done < <(parse_tree_body "$tmptree")
+    rm -f "$tmptree"
+}
+```
+
+---
 
 ## Case 1: Diff two commits
 
-### Step 1: Resolve commit SHAs
-
-If user provides branch names or relative refs like `HEAD~2`, resolve them:
-
 ```bash
-python3 << 'PYEOF'
-import os, zlib
+SHA_A="REPLACE_OLDER_SHA"    # e.g. parent commit
+SHA_B="REPLACE_NEWER_SHA"    # e.g. HEAD
 
-def resolve_ref(ref):
-    """Resolve a branch name or 'HEAD' to a commit SHA."""
-    # Check .git/refs/heads/
-    path = f".git/refs/heads/{ref}"
-    if os.path.exists(path):
-        return open(path).read().strip()
-    # Check HEAD
-    head = open('.git/HEAD').read().strip()
-    if ref == 'HEAD':
-        if head.startswith('ref: '):
-            rpath = '.git/' + head[5:]
-            return open(rpath).read().strip() if os.path.exists(rpath) else None
-        return head
-    return ref  # assume it's already a SHA
+OUTPUT_PATCH="changes.patch"
 
-def get_tree(commit_sha):
-    data = zlib.decompress(open(f'.git/objects/{commit_sha[:2]}/{commit_sha[2:]}', 'rb').read())
-    null = data.index(b'\x00')
-    body = data[null+1:].decode()
-    for line in body.split('\n'):
-        if line.startswith('tree '):
-            return line[5:]
-    return None
+# Get tree SHAs
+get_tree_sha() {
+    local sha="$1"
+    local tmpraw=$(mktemp) tmpbody=$(mktemp)
+    git_decompress ".git/objects/${sha:0:2}/${sha:2}" > "$tmpraw"
+    obj_body_to_file "$tmpraw" "$tmpbody"; rm -f "$tmpraw"
+    grep '^tree ' "$tmpbody" | awk '{print $2}'; rm -f "$tmpbody"
+}
 
-sha_a = resolve_ref("REPLACE_SHA_A")  # older commit
-sha_b = resolve_ref("REPLACE_SHA_B")  # newer commit
+tree_a=$(get_tree_sha "$SHA_A")
+tree_b=$(get_tree_sha "$SHA_B")
 
-print(f"SHA_A: {sha_a}")
-print(f"SHA_B: {sha_b}")
-print(f"TREE_A: {get_tree(sha_a)}")
-print(f"TREE_B: {get_tree(sha_b)}")
-PYEOF
+# Build path→sha maps (stored as files)
+tmpmap_a=$(mktemp); tmpmap_b=$(mktemp)
+walk_tree "$tree_a" "" | sort > "$tmpmap_a"
+walk_tree "$tree_b" "" | sort > "$tmpmap_b"
+
+# Collect all paths
+all_paths=$(cat "$tmpmap_a" "$tmpmap_b" | awk '{print $2}' | sort -u)
+
+> "$OUTPUT_PATCH"
+
+while IFS= read -r path; do
+    sha_a=$(grep " $path$" "$tmpmap_a" | awk '{print $1}')
+    sha_b=$(grep " $path$" "$tmpmap_b" | awk '{print $1}')
+
+    [ "$sha_a" = "$sha_b" ] && continue   # identical — skip
+
+    # Extract blob contents to tmpfiles
+    tmpa=$(mktemp); tmpb=$(mktemp)
+
+    if [ -n "$sha_a" ]; then
+        tmpraw=$(mktemp)
+        git_decompress ".git/objects/${sha_a:0:2}/${sha_a:2}" > "$tmpraw"
+        obj_body_to_file "$tmpraw" "$tmpa"; rm -f "$tmpraw"
+    fi
+
+    if [ -n "$sha_b" ]; then
+        tmpraw=$(mktemp)
+        git_decompress ".git/objects/${sha_b:0:2}/${sha_b:2}" > "$tmpraw"
+        obj_body_to_file "$tmpraw" "$tmpb"; rm -f "$tmpraw"
+    fi
+
+    # Generate unified diff (diff exits 1 when files differ — that's normal)
+    diff -u \
+        --label "a/$path" \
+        --label "b/$path" \
+        "$tmpa" "$tmpb" >> "$OUTPUT_PATCH" || true
+
+    rm -f "$tmpa" "$tmpb"
+done <<< "$all_paths"
+
+rm -f "$tmpmap_a" "$tmpmap_b"
+printf 'Patch written to %s\n' "$OUTPUT_PATCH"
 ```
-
-### Step 2: Generate the patch
-
-```bash
-python3 << 'PYEOF'
-import zlib, difflib, os
-
-def read_obj(sha):
-    data = zlib.decompress(open(f'.git/objects/{sha[:2]}/{sha[2:]}', 'rb').read())
-    null = data.index(b'\x00')
-    return data[:null].decode().split()[0], data[null+1:]
-
-def walk_tree(tree_sha, prefix=''):
-    _, body = read_obj(tree_sha)
-    i, files = 0, {}
-    while i < len(body):
-        sp = body.index(b' ', i)
-        null = body.index(b'\x00', sp)
-        mode = body[i:sp].decode()
-        name = body[sp+1:null].decode()
-        entry_sha = body[null+1:null+21].hex()
-        path = f"{prefix}/{name}" if prefix else name
-        if mode in ('40000', '040000'):
-            files.update(walk_tree(entry_sha, path))
-        else:
-            files[path] = (mode, entry_sha)
-        i = null + 21
-    return files
-
-TREE_SHA_A = "REPLACE_TREE_A"
-TREE_SHA_B = "REPLACE_TREE_B"
-OUTPUT_FILE = "changes.patch"  # or user-specified
-
-files_a = walk_tree(TREE_SHA_A)
-files_b = walk_tree(TREE_SHA_B)
-all_paths = sorted(set(list(files_a.keys()) + list(files_b.keys())))
-
-patch_lines = []
-for path in all_paths:
-    info_a = files_a.get(path)
-    info_b = files_b.get(path)
-
-    if info_a and info_b and info_a[1] == info_b[1]:
-        continue  # identical blob SHAs — no change
-
-    if info_a:
-        _, content = read_obj(info_a[1])
-        try:
-            lines_a = content.decode('utf-8').splitlines(keepends=True)
-            is_binary_a = False
-        except UnicodeDecodeError:
-            lines_a = []
-            is_binary_a = True
-    else:
-        lines_a, is_binary_a = [], False
-
-    if info_b:
-        _, content = read_obj(info_b[1])
-        try:
-            lines_b = content.decode('utf-8').splitlines(keepends=True)
-            is_binary_b = False
-        except UnicodeDecodeError:
-            lines_b = []
-            is_binary_b = True
-    else:
-        lines_b, is_binary_b = [], False
-
-    if is_binary_a or is_binary_b:
-        patch_lines.append(f"Binary files a/{path} and b/{path} differ\n")
-        continue
-
-    diff = list(difflib.unified_diff(
-        lines_a, lines_b,
-        fromfile=f"a/{path}",
-        tofile=f"b/{path}",
-        lineterm=''
-    ))
-    if diff:
-        patch_lines.extend(line + '\n' for line in diff)
-
-patch_text = ''.join(patch_lines)
-with open(OUTPUT_FILE, 'w') as f:
-    f.write(patch_text)
-print(f"Patch written to {OUTPUT_FILE} ({len(patch_lines)} lines)")
-PYEOF
-```
-
-## Case 2: Single commit patch (commit vs its parent)
-
-For a commit with SHA `X`, get its parent SHA, then use Case 1 with `SHA_A = parent`, `SHA_B = X`.
-
-Add the email-style header at the top of the patch file:
-
-```
-From <sha> <date>
-From: <author name> <email>
-Date: <date string>
-Subject: [PATCH] <commit message first line>
 
 ---
-```
 
-## Case 3: Diff working tree vs HEAD
+## Case 2: Single commit vs its parent
 
 ```bash
-python3 << 'PYEOF'
-import zlib, difflib, os
+COMMIT_SHA="REPLACE"
 
-def read_obj(sha):
-    data = zlib.decompress(open(f'.git/objects/{sha[:2]}/{sha[2:]}', 'rb').read())
-    null = data.index(b'\x00')
-    return data[:null].decode().split()[0], data[null+1:]
+# Get parent SHA
+tmpraw=$(mktemp); tmpbody=$(mktemp)
+git_decompress ".git/objects/${COMMIT_SHA:0:2}/${COMMIT_SHA:2}" > "$tmpraw"
+obj_body_to_file "$tmpraw" "$tmpbody"; rm -f "$tmpraw"
 
-def walk_tree(tree_sha, prefix=''):
-    _, body = read_obj(tree_sha)
-    i, files = 0, {}
-    while i < len(body):
-        sp = body.index(b' ', i)
-        null = body.index(b'\x00', sp)
-        mode = body[i:sp].decode()
-        name = body[sp+1:null].decode()
-        entry_sha = body[null+1:null+21].hex()
-        path = f"{prefix}/{name}" if prefix else name
-        if mode in ('40000', '040000'):
-            files.update(walk_tree(entry_sha, path))
-        else:
-            files[path] = (mode, entry_sha)
-        i = null + 21
-    return files
+parent_sha=$(grep '^parent ' "$tmpbody" | head -1 | awk '{print $2}')
+author=$(grep '^author ' "$tmpbody" | sed 's/^author //')
+msg=$(awk 'found{print} /^$/{found=1}' "$tmpbody" | head -1)
+rm -f "$tmpbody"
 
-# Get HEAD tree
-head = open('.git/HEAD').read().strip()
-if head.startswith('ref: '):
-    commit_sha = open('.git/' + head[5:]).read().strip()
-else:
-    commit_sha = head
+# Optionally prepend email-format header
+printf 'From %s Mon Sep 17 00:00:00 2001\nFrom: %s\nSubject: [PATCH] %s\n\n---\n' \
+    "$COMMIT_SHA" "$author" "$msg" > changes.patch
 
-_, cbody = read_obj(commit_sha)
-tree_sha = next(l[5:] for l in cbody.decode().split('\n') if l.startswith('tree '))
-head_files = walk_tree(tree_sha)
-
-# Scan working tree
-working_files = {}
-for root, dirs, files in os.walk('.'):
-    dirs[:] = [d for d in dirs if d != '.git']
-    for f in files:
-        full = os.path.join(root, f)
-        path = full[2:] if full.startswith('./') else full
-        working_files[path] = full
-
-all_paths = sorted(set(list(head_files.keys()) + list(working_files.keys())))
-patch_lines = []
-
-for path in all_paths:
-    in_head = path in head_files
-    on_disk = path in working_files
-
-    if in_head:
-        _, blob_content = read_obj(head_files[path][1])
-        try:
-            lines_a = blob_content.decode('utf-8').splitlines(keepends=True)
-        except:
-            lines_a = []
-    else:
-        lines_a = []
-
-    if on_disk:
-        with open(working_files[path], 'rb') as fh:
-            disk_content = fh.read()
-        try:
-            lines_b = disk_content.decode('utf-8').splitlines(keepends=True)
-        except:
-            lines_b = []
-    else:
-        lines_b = []
-
-    diff = list(difflib.unified_diff(lines_a, lines_b,
-                                      fromfile=f"a/{path}", tofile=f"b/{path}", lineterm=''))
-    if diff:
-        patch_lines.extend(line + '\n' for line in diff)
-
-patch_text = ''.join(patch_lines)
-if patch_text:
-    with open('working.patch', 'w') as f:
-        f.write(patch_text)
-    print(f"Patch written to working.patch")
-else:
-    print("No changes detected")
-PYEOF
+# Then diff parent → commit and append
+SHA_A="$parent_sha"
+SHA_B="$COMMIT_SHA"
+# ... run Case 1 code above, appending to changes.patch
 ```
 
-## Output
+---
 
-Report: `Created <filename> (+N lines / -N lines, N files changed)`
+## Case 3: HEAD vs working tree
+
+```bash
+OUTPUT_PATCH="working.patch"
+
+# Resolve HEAD tree
+head=$(cat .git/HEAD)
+case "$head" in
+    ref:\ *) commit_sha=$(cat ".git/${head#ref: }" | tr -d '\n') ;;
+    *)       commit_sha="$head" ;;
+esac
+
+tmpraw=$(mktemp); tmpbody=$(mktemp)
+git_decompress ".git/objects/${commit_sha:0:2}/${commit_sha:2}" > "$tmpraw"
+obj_body_to_file "$tmpraw" "$tmpbody"; rm -f "$tmpraw"
+head_tree=$(grep '^tree ' "$tmpbody" | awk '{print $2}'); rm -f "$tmpbody"
+
+tmpmap=$(mktemp)
+walk_tree "$head_tree" "" | sort > "$tmpmap"
+
+> "$OUTPUT_PATCH"
+
+# Compare each HEAD blob vs its on-disk counterpart
+while IFS=' ' read -r sha path; do
+    [ ! -f "$path" ] && continue   # deleted — show as empty vs disk
+    tmpblob=$(mktemp); tmpraw=$(mktemp)
+    git_decompress ".git/objects/${sha:0:2}/${sha:2}" > "$tmpraw"
+    obj_body_to_file "$tmpraw" "$tmpblob"; rm -f "$tmpraw"
+    diff -u --label "a/$path" --label "b/$path" "$tmpblob" "$path" >> "$OUTPUT_PATCH" || true
+    rm -f "$tmpblob"
+done < "$tmpmap"
+
+# New files (on disk but not in HEAD)
+find . -not -path './.git/*' -type f | sort | while IFS= read -r path; do
+    norm="${path#./}"
+    grep -q " $norm$" "$tmpmap" && continue
+    diff -u --label "a/$norm" --label "b/$norm" /dev/null "$path" >> "$OUTPUT_PATCH" || true
+done
+
+rm -f "$tmpmap"
+
+if [ -s "$OUTPUT_PATCH" ]; then
+    printf 'Patch written to %s\n' "$OUTPUT_PATCH"
+else
+    printf 'No changes detected\n'
+fi
+```

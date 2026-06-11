@@ -1,88 +1,71 @@
 # Agent: git init
 
-Initialize a new git repository in the target directory.
+Initialize a new git repository. No `git` binary. Pure `mkdir` + `printf`.
 
 ## Steps
 
 ### 1. Determine target directory
 
-- Default: current working directory (`.`)
-- If the user specified a path, use that (create the directory if it doesn't exist)
+Default: current directory (`.`). Use a user-specified path if provided.
 
 ```bash
-TARGET_DIR="."   # or user-specified path
-mkdir -p "$TARGET_DIR"
+TARGET="${1:-.}"
+mkdir -p "$TARGET"
+cd "$TARGET"
 ```
 
 ### 2. Check if already initialized
 
 ```bash
-ls "$TARGET_DIR/.git" 2>/dev/null && echo "EXISTS" || echo "CLEAN"
+[ -d .git ] && echo "Already a git repository" && exit 0
 ```
 
-If `.git/` already exists, warn the user and ask before reinitializing.
+Warn the user and stop. If they want to reinitialize, they must confirm.
 
 ### 3. Create directory structure
 
 ```bash
 mkdir -p \
-  "$TARGET_DIR/.git/objects/pack" \
-  "$TARGET_DIR/.git/objects/info" \
-  "$TARGET_DIR/.git/refs/heads" \
-  "$TARGET_DIR/.git/refs/tags" \
-  "$TARGET_DIR/.git/info"
+  .git/objects/pack \
+  .git/objects/info \
+  .git/refs/heads \
+  .git/refs/tags \
+  .git/info
 ```
 
 ### 4. Write core files
 
 Write `.git/HEAD`:
-```
-ref: refs/heads/main
+```bash
+printf 'ref: refs/heads/main\n' > .git/HEAD
 ```
 
 Write `.git/config`:
-```ini
-[core]
-	repositoryformatversion = 0
-	filemode = true
-	bare = false
-	logallrefupdates = true
+```bash
+printf '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n' > .git/config
 ```
 
 Write `.git/description`:
-```
-Unnamed repository; edit this file 'description' to name the repository.
+```bash
+printf "Unnamed repository; edit this file 'description' to name the repository.\n" > .git/description
 ```
 
 Write `.git/info/exclude`:
-```
-# git ls-files --others --exclude-from=.git/info/exclude
-# Lines that start with '#' are comments.
-.DS_Store
-Thumbs.db
-*.swp
-*~
+```bash
+printf '# git ls-files --others --exclude-from=.git/info/exclude\n.DS_Store\nThumbs.db\n*.swp\n*~\n' > .git/info/exclude
 ```
 
-### 5. Optionally configure user identity
+### 5. Optionally set user identity
 
-If the user provided a name and email, append to `.git/config`:
+If the user provided name and/or email, append to `.git/config`:
 
-```ini
-[user]
-	name = <provided name>
-	email = <provided email>
+```bash
+# Only if name provided
+printf '[user]\n\tname = %s\n\temail = %s\n' "$USER_NAME" "$USER_EMAIL" >> .git/config
 ```
-
-If not provided, skip — the commit agent will ask when needed.
 
 ### 6. Report success
 
-```
-Initialized empty Git repository in <absolute-path>/.git/
-```
-
-Resolve to absolute path with:
 ```bash
-realpath "$TARGET_DIR"
+printf 'Initialized empty Git repository in %s/.git/\n' "$(pwd)"
 ```

@@ -1,164 +1,140 @@
 # Agent: git remote
 
-Add, remove, rename, or list remote repositories. All operations read/write `.git/config` directly.
+Add, remove, rename, or list remotes. All operations read/write `.git/config` — plain text INI. No binary, no `git`, no `python3`.
+
+---
 
 ## List remotes
 
 ```bash
-cat .git/config
+# Names only
+awk '/^\[remote "/{gsub(/.*"/,""); gsub(/"\].*/,""); print}' .git/config
+
+# With URLs (-v style)
+awk '/^\[remote "/{name=$0; gsub(/.*"/,"",name); gsub(/"\].*/,"",name)}
+     /url *=/{gsub(/.*= */,""); printf "%s\t%s (fetch)\n%s\t%s (push)\n", name, $0, name, $0}' \
+    .git/config
 ```
 
-Parse and display all `[remote "..."]` sections:
-
-```bash
-python3 -c "
-import re
-cfg = open('.git/config').read()
-remotes = re.findall(r'\[remote \"([^\"]+)\"\].*?\n\s*url\s*=\s*([^\n]+)', cfg, re.DOTALL)
-for name, url in remotes:
-    print(f'{name}\t{url.strip()}')
-"
-```
-
-For `remote -v`, show both fetch and push URL (same unless overridden):
-```
-origin  git@github.com:owner/repo.git (fetch)
-origin  git@github.com:owner/repo.git (push)
-```
+---
 
 ## Add a remote
 
-Append a new section to `.git/config`:
-
 ```bash
-python3 << 'PYEOF'
-NAME = "REPLACE_NAME"   # e.g. "origin"
-URL  = "REPLACE_URL"    # e.g. "git@github.com:owner/repo.git"
+NAME="REPLACE_NAME"    # e.g. "origin"
+URL="REPLACE_URL"      # e.g. "git@github.com:owner/repo.git"
 
-new_section = f'\n[remote "{NAME}"]\n\turl = {URL}\n\tfetch = +refs/heads/*:refs/remotes/{NAME}/*\n'
+# Check not already present
+grep -q "^\[remote \"$NAME\"\]" .git/config && {
+    echo "error: remote '$NAME' already exists"
+    exit 1
+}
 
-with open('.git/config', 'a') as f:
-    f.write(new_section)
-print(f"Added remote '{NAME}' -> {URL}")
-PYEOF
+printf '\n[remote "%s"]\n\turl = %s\n\tfetch = +refs/heads/*:refs/remotes/%s/*\n' \
+    "$NAME" "$URL" "$NAME" >> .git/config
+
+printf "Added remote '%s' -> %s\n" "$NAME" "$URL"
 ```
 
-Verify the remote doesn't already exist before adding:
-```bash
-grep -q "remote \"$NAME\"" .git/config && echo "EXISTS" || echo "OK"
-```
+---
 
 ## Remove a remote
 
-Delete the `[remote "<name>"]` section and all its indented config lines:
-
 ```bash
-python3 << 'PYEOF'
-import re
-NAME = "REPLACE_NAME"
+NAME="REPLACE_NAME"
 
-with open('.git/config') as f:
-    cfg = f.read()
+grep -q "^\[remote \"$NAME\"\]" .git/config || {
+    echo "error: no such remote: '$NAME'"
+    exit 1
+}
 
-# Remove the section block: from [remote "name"] to the next [section] or EOF
-pattern = rf'\n?\[remote "{re.escape(NAME)}"\][^\[]*'
-new_cfg = re.sub(pattern, '', cfg)
+# Remove [remote "NAME"] block: from the section header to the next [ or EOF
+awk "
+/^\[remote \"$NAME\"\]/ { skip=1; next }
+skip && /^\[/ { skip=0 }
+!skip { print }
+" .git/config > /tmp/config.tmp && mv /tmp/config.tmp .git/config
 
-if new_cfg == cfg:
-    print(f"error: No such remote: '{NAME}'")
-else:
-    with open('.git/config', 'w') as f:
-        f.write(new_cfg)
-    print(f"Removed remote '{NAME}'")
-PYEOF
+# Remove tracking refs
+rm -f ".git/refs/remotes/$NAME"/*
+rmdir ".git/refs/remotes/$NAME" 2>/dev/null || true
+
+printf "Removed remote '%s'\n" "$NAME"
 ```
 
-Also clean up any tracking refs:
-```bash
-rm -f .git/refs/remotes/<name>/*
-rmdir .git/refs/remotes/<name> 2>/dev/null || true
-```
+---
 
 ## Rename a remote
 
 ```bash
-python3 << 'PYEOF'
-OLD_NAME = "REPLACE_OLD"
-NEW_NAME = "REPLACE_NEW"
+OLD="REPLACE_OLD"
+NEW="REPLACE_NEW"
 
-with open('.git/config') as f:
-    cfg = f.read()
+grep -q "^\[remote \"$OLD\"\]" .git/config || {
+    echo "error: no such remote: '$OLD'"
+    exit 1
+}
 
-# Replace section header and fetch refspec
-cfg = cfg.replace(f'[remote "{OLD_NAME}"]', f'[remote "{NEW_NAME}"]')
-cfg = cfg.replace(f'refs/remotes/{OLD_NAME}/', f'refs/remotes/{NEW_NAME}/')
+sed -i \
+    -e "s/^\[remote \"$OLD\"\]/[remote \"$NEW\"]/" \
+    -e "s|refs/remotes/$OLD/|refs/remotes/$NEW/|g" \
+    .git/config
 
-with open('.git/config', 'w') as f:
-    f.write(cfg)
+# Move tracking ref directory
+[ -d ".git/refs/remotes/$OLD" ] && mv ".git/refs/remotes/$OLD" ".git/refs/remotes/$NEW"
 
-print(f"Renamed remote '{OLD_NAME}' -> '{NEW_NAME}'")
-PYEOF
+printf "Renamed remote '%s' -> '%s'\n" "$OLD" "$NEW"
 ```
 
-Move tracking refs:
-```bash
-if [ -d .git/refs/remotes/<old-name> ]; then
-    mv .git/refs/remotes/<old-name> .git/refs/remotes/<new-name>
-fi
-```
+---
 
 ## Change remote URL
 
 ```bash
-python3 << 'PYEOF'
-import re
-NAME    = "REPLACE_NAME"
-NEW_URL = "REPLACE_URL"
+NAME="REPLACE_NAME"
+NEW_URL="REPLACE_URL"
 
-with open('.git/config') as f:
-    cfg = f.read()
+grep -q "^\[remote \"$NAME\"\]" .git/config || {
+    echo "error: no such remote: '$NAME'"
+    exit 1
+}
 
-# Find [remote "NAME"] section and replace its url line
-pattern = rf'(\[remote "{re.escape(NAME)}"\][^\[]*?url\s*=\s*)([^\n]+)'
-new_cfg = re.sub(pattern, lambda m: m.group(1) + NEW_URL, cfg, flags=re.DOTALL)
+# Replace the url = line inside the [remote "NAME"] section
+awk "
+/^\[remote \"$NAME\"\]/ { in_section=1 }
+in_section && /^\[/ && !/^\[remote \"$NAME\"\]/ { in_section=0 }
+in_section && /url *=/ { print \"\turl = $NEW_URL\"; next }
+{ print }
+" .git/config > /tmp/config.tmp && mv /tmp/config.tmp .git/config
 
-if new_cfg == cfg:
-    print(f"error: no remote '{NAME}' or url line not found")
-else:
-    with open('.git/config', 'w') as f:
-        f.write(new_cfg)
-    print(f"Updated remote '{NAME}' URL -> {NEW_URL}")
-PYEOF
+printf "Updated remote '%s' URL -> %s\n" "$NAME" "$NEW_URL"
 ```
+
+---
 
 ## Show remote details
 
 ```bash
-python3 << 'PYEOF'
-import re
-NAME = "REPLACE_NAME"
+NAME="REPLACE_NAME"
 
-cfg = open('.git/config').read()
-# Extract the remote section
-m = re.search(rf'\[remote "{re.escape(NAME)}"\]([^\[]*)', cfg)
-if not m:
-    print(f"error: no such remote: '{NAME}'")
-else:
-    section = m.group(1)
-    url_m = re.search(r'url\s*=\s*(.+)', section)
-    url = url_m.group(1).strip() if url_m else '(none)'
-    
-    # Check remote tracking refs
-    import os
-    remote_ref_dir = f'.git/refs/remotes/{NAME}'
-    branches = os.listdir(remote_ref_dir) if os.path.isdir(remote_ref_dir) else []
-    
-    print(f"* remote {NAME}")
-    print(f"  Fetch URL: {url}")
-    print(f"  Push  URL: {url}")
-    print(f"  Remote branches:")
-    for b in sorted(branches):
-        sha = open(f'{remote_ref_dir}/{b}').read().strip()
-        print(f"    {b} ({sha[:7]})")
-PYEOF
+grep -q "^\[remote \"$NAME\"\]" .git/config || {
+    echo "error: no such remote: '$NAME'"
+    exit 1
+}
+
+url=$(awk "/^\[remote \"$NAME\"\]/{f=1} f&&/url *=/{gsub(/.*= */,\"\");print;exit}" .git/config)
+
+printf '* remote %s\n' "$NAME"
+printf '  Fetch URL: %s\n' "$url"
+printf '  Push  URL: %s\n' "$url"
+
+ref_dir=".git/refs/remotes/$NAME"
+if [ -d "$ref_dir" ]; then
+    printf '  Remote branches:\n'
+    for ref in "$ref_dir"/*; do
+        branch=$(basename "$ref")
+        sha=$(cat "$ref" | tr -d '\n')
+        printf '    %s (%s)\n' "$branch" "${sha:0:7}"
+    done
+fi
 ```
