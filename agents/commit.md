@@ -102,7 +102,7 @@ build_tree() {
         local name; name=$(basename "$subdir")
         local sub_sha; sub_sha=$(build_tree "$subdir")
         [ -z "$sub_sha" ] && continue
-        printf '%s %s\n' "40000 $name" "$sub_sha"
+        printf '%s %s %s\n' "40000" "$name" "$sub_sha"
     done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d ! -name '.git' | sort) >> "$tmpentries"
 
     # Files in this directory
@@ -117,7 +117,7 @@ build_tree() {
 
         local sha="${blob_shas[$f]}"
         [ -x "$f" ] && mode="100755" || mode="100644"
-        printf '%s %s\n' "$mode $fname" "$sha"
+        printf '%s %s %s\n' "$mode" "$fname" "$sha"
     done >> "$tmpentries"
 
     # Sort entries (files by name; dirs by name + "/")
@@ -128,9 +128,7 @@ build_tree() {
 
     # Build binary tree content
     local tmptree; tmptree=$(mktemp)
-    while IFS=' ' read -r mode_name sha; do
-        local mode="${mode_name% *}"
-        local name="${mode_name#* }"
+    while IFS=' ' read -r mode name sha; do
         printf '%s %s\0' "$mode" "$name" >> "$tmptree"
         hex_to_bin "$sha"              >> "$tmptree"
     done <<< "$sorted"
@@ -169,11 +167,6 @@ tz=$(date +%z)
 author_str="$author_name <$author_email> $ts $tz"
 
 tmpcmt=$(mktemp)
-printf 'tree %s\n' "$root_tree_sha" > "$tmpcmt"
-[ -n "$parent" ] && printf 'parent %s\n' "$parent" >> "$tmpcmt"
-printf 'author %s\nauthor %s\n\n%s\n' \
-    "$author_str" "$author_str" "$COMMIT_MESSAGE" >> "$tmpcmt"
-# Note: second 'author' line should be 'committer' — fix:
 {
     printf 'tree %s\n' "$root_tree_sha"
     [ -n "$parent" ] && printf 'parent %s\n' "$parent"

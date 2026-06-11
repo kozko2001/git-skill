@@ -39,7 +39,8 @@ remote_sha=$(printf '%s' "$remote_resp" | jq -r '.object.sha // empty')
 
 ### A2. Find new commits to push
 
-Walk back from `$local_sha` until we reach `$remote_sha` (or no more parents):
+Walk back from `$local_sha` until we reach `$remote_sha` (or no more parents).
+Objects are stored body-only (no `type size\0` prefix) — decompress gives the body directly.
 
 ```bash
 git_decompress() {
@@ -49,20 +50,15 @@ git_decompress() {
       printf '\x00\x00\x00\x00\x00\x00\x00\x00'
     } | gzip -d -f -q 2>/dev/null
 }
-first_null_pos() {
-    od -A n -t u1 -v "$1" | tr -s ' \n' '\n' | grep -v '^$' | \
-    awk 'NR>0{if($1+0==0){print NR-1;exit}}'
-}
-obj_body_to_file() { local pos; pos=$(first_null_pos "$1"); dd if="$1" bs=1 skip=$(( pos+1 )) 2>/dev/null > "$2"; }
 
 to_push=()
 sha="$local_sha"
 while [ -n "$sha" ] && [ "$sha" != "$remote_sha" ]; do
     to_push=("$sha" "${to_push[@]}")   # prepend → oldest first
-    tmpraw=$(mktemp); tmpbody=$(mktemp)
-    git_decompress ".git/objects/${sha:0:2}/${sha:2}" > "$tmpraw"
-    obj_body_to_file "$tmpraw" "$tmpbody"; rm -f "$tmpraw"
-    sha=$(grep '^parent ' "$tmpbody" | head -1 | awk '{print $2}'); rm -f "$tmpbody"
+    tmpbody=$(mktemp)
+    git_decompress ".git/objects/${sha:0:2}/${sha:2}" > "$tmpbody"
+    sha=$(grep '^parent ' "$tmpbody" | head -1 | awk '{print $2}')
+    rm -f "$tmpbody"
 done
 ```
 
@@ -76,9 +72,8 @@ parse_tree_body() {
 
 walk_tree() {
     local tree_sha="$1" prefix="$2"
-    local tmpraw=$(mktemp) tmptree=$(mktemp)
-    git_decompress ".git/objects/${tree_sha:0:2}/${tree_sha:2}" > "$tmpraw"
-    obj_body_to_file "$tmpraw" "$tmptree"; rm -f "$tmpraw"
+    local tmptree; tmptree=$(mktemp)
+    git_decompress ".git/objects/${tree_sha:0:2}/${tree_sha:2}" > "$tmptree"
     while IFS=' ' read -r mode sha name; do
         local path="${prefix:+$prefix/}$name"
         if [ "$mode" = "40000" ] || [ "$mode" = "040000" ]; then walk_tree "$sha" "$path"
@@ -91,20 +86,18 @@ API="https://api.github.com/repos/$owner/$repo/git"
 prev_remote_sha="$remote_sha"
 
 for commit_sha in "${to_push[@]}"; do
-    tmpraw=$(mktemp); tmpbody=$(mktemp)
-    git_decompress ".git/objects/${commit_sha:0:2}/${commit_sha:2}" > "$tmpraw"
-    obj_body_to_file "$tmpraw" "$tmpbody"; rm -f "$tmpraw"
-    tree_sha=$(grep '^tree '   "$tmpbody" | awk '{print $2}')
-    author=$(grep  '^author '  "$tmpbody" | sed 's/^author //')
+    tmpbody=$(mktemp)
+    git_decompress ".git/objects/${commit_sha:0:2}/${commit_sha:2}" > "$tmpbody"
+    tree_sha=$(grep '^tree '  "$tmpbody" | awk '{print $2}')
+    author=$(grep  '^author ' "$tmpbody" | sed 's/^author //')
     msg=$(awk 'f{print} /^$/{f=1}' "$tmpbody" | head -1)
     rm -f "$tmpbody"
 
     # Upload blobs and build tree entries for GitHub API
     gh_tree_entries="[]"
     while IFS=' ' read -r blob_sha path; do
-        tmpraw=$(mktemp); tmpbody=$(mktemp)
-        git_decompress ".git/objects/${blob_sha:0:2}/${blob_sha:2}" > "$tmpraw"
-        obj_body_to_file "$tmpraw" "$tmpbody"; rm -f "$tmpraw"
+        tmpbody=$(mktemp)
+        git_decompress ".git/objects/${blob_sha:0:2}/${blob_sha:2}" > "$tmpbody"
         encoded=$(base64 < "$tmpbody"); rm -f "$tmpbody"
         gh_blob_sha=$(curl -sf -X POST \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
@@ -178,121 +171,148 @@ Uses `ssh` binary + pack file built with `gzip`/`dd`/`sha1sum`. No `git` binary.
 
 ```bash
 # From remote_url: "git@github.com:owner/repo.git"
-ssh_host="github.com"
+ssh_host="git@github.com"
 repo_path="${remote_url#*:}"     # "owner/repo.git"
 ```
 
-### B2. Build the PACK file
+### B2. Collect objects and build the PACK file
+
+Objects are stored body-only (no `type size\0` prefix). Track types during BFS traversal
+instead of reading them from file headers.
 
 ```bash
-# Collect all objects reachable from local_sha not in remote
-# For simplicity: collect all objects in the commit chain (blobs+trees+commits)
-
-collect_objects() {
-    local sha="$1" stop="$2"
-    local seen_file; seen_file=$(mktemp)
-    local queue=("$sha")
-    while [ "${#queue[@]}" -gt 0 ]; do
-        local current="${queue[0]}"; queue=("${queue[@]:1}")
-        grep -qF "$current" "$seen_file" 2>/dev/null && continue
-        [ "$current" = "$stop" ] && continue
-        printf '%s\n' "$current" >> "$seen_file"
-        local tmpraw=$(mktemp) tmpbody=$(mktemp)
-        git_decompress ".git/objects/${current:0:2}/${current:2}" > "$tmpraw"
-        obj_body_to_file "$tmpraw" "$tmpbody"; rm -f "$tmpraw"
-        local obj_type; obj_type=$(head -c 10 ".git/objects/${current:0:2}/${current:2}" | \
-            git_decompress ".git/objects/${current:0:2}/${current:2}" 2>/dev/null | \
-            head -c 10 | tr -d '\0' | awk '{print $1}')
-        # Actually re-read header properly
-        local tmpfull=$(mktemp)
-        git_decompress ".git/objects/${current:0:2}/${current:2}" > "$tmpfull"
-        local hlen; hlen=$(first_null_pos "$tmpfull")
-        obj_type=$(dd if="$tmpfull" bs=1 count="$hlen" 2>/dev/null | awk '{print $1}')
-        rm -f "$tmpfull"
-        case "$obj_type" in
-            commit)
-                grep '^tree \|^parent ' "$tmpbody" | awk '{print $2}' | \
-                    while IFS= read -r ref; do queue+=("$ref"); done ;;
-            tree)
-                while IFS=' ' read -r mode sha name; do queue+=("$sha"); done \
-                    < <(parse_tree_body "$tmpbody") ;;
-        esac
-        rm -f "$tmpbody"
-    done
-    cat "$seen_file"; rm -f "$seen_file"
+git_decompress() {
+    local obj=".git/objects/${1:0:2}/${1:2}"
+    local size; size=$(wc -c < "$obj"); local ds=$(( size - 6 ))
+    { printf '\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03'
+      dd if="$obj" bs=1 skip=2 count="$ds" 2>/dev/null
+      printf '\x00\x00\x00\x00\x00\x00\x00\x00'
+    } | gzip -d -f -q 2>/dev/null
 }
 
-objects=$(collect_objects "$local_sha" "$remote_sha")
-obj_count=$(printf '%s\n' "$objects" | grep -c .)
+parse_tree_body() {
+    od -A n -t u1 -v "$1" | tr -s ' \n' ' ' | sed 's/^ //;s/ $//' | \
+    awk '{n=split($0,b," ");i=1;while(i<=n){mode="";while(i<=n&&b[i]+0!=32){mode=mode sprintf("%c",b[i]+0);i++};i++;name="";while(i<=n&&b[i]+0!=0){name=name sprintf("%c",b[i]+0);i++};i++;sha="";for(j=0;j<20&&i<=n;j++){sha=sha sprintf("%02x",b[i]+0);i++};if(mode!="")print mode,sha,name}}'
+}
 
-# Build pack file: PACK header + objects + SHA checksum
+# Get remote SHA (empty = new branch)
+remote_sha=$(cat ".git/refs/remotes/origin/$branch" 2>/dev/null | tr -d '\n')
+
+# BFS: collect (sha, type) pairs not already on remote
+objects_tmp=$(mktemp)
+
+commits=("$local_sha")
+while [ "${#commits[@]}" -gt 0 ]; do
+    sha="${commits[0]}"; commits=("${commits[@]:1}")
+    grep -qF "$sha" "$objects_tmp" && continue
+    [ "$sha" = "$remote_sha" ] && continue
+    printf '%s commit\n' "$sha" >> "$objects_tmp"
+    tmpbody=$(mktemp)
+    git_decompress "$sha" > "$tmpbody"
+    tree_sha=$(grep '^tree ' "$tmpbody" | awk '{print $2}')
+    grep -qF "$tree_sha" "$objects_tmp" || printf '%s tree\n' "$tree_sha" >> "$objects_tmp"
+    while IFS= read -r p; do commits+=("$p"); done \
+        < <(grep '^parent ' "$tmpbody" | awk '{print $2}')
+    rm -f "$tmpbody"
+done
+
+pending=()
+while IFS=' ' read -r sha type; do
+    [ "$type" = "tree" ] && pending+=("$sha")
+done < "$objects_tmp"
+
+while [ "${#pending[@]}" -gt 0 ]; do
+    sha="${pending[0]}"; pending=("${pending[@]:1}")
+    tmpbody=$(mktemp)
+    git_decompress "$sha" > "$tmpbody"
+    while IFS=' ' read -r mode child_sha name; do
+        grep -qF "$child_sha" "$objects_tmp" && continue
+        if [ "$mode" = "40000" ] || [ "$mode" = "040000" ]; then
+            printf '%s tree\n' "$child_sha" >> "$objects_tmp"
+            pending+=("$child_sha")
+        else
+            printf '%s blob\n' "$child_sha" >> "$objects_tmp"
+        fi
+    done < <(parse_tree_body "$tmpbody")
+    rm -f "$tmpbody"
+done
+
+obj_count=$(wc -l < "$objects_tmp")
+
+# Build pack file: PACK header + objects (varlen header + zlib body) + SHA checksum
 pack_tmp=$(mktemp)
 {
     printf 'PACK'
     printf '\x00\x00\x00\x02'    # version 2
-    # 4-byte big-endian object count
     printf "$(printf '%08x' "$obj_count" | sed 's/../\\x&/g')"
 
-    while IFS= read -r sha; do
+    while IFS=' ' read -r sha type_str; do
         [ -z "$sha" ] && continue
-        tmpraw=$(mktemp)
-        git_decompress ".git/objects/${sha:0:2}/${sha:2}" > "$tmpraw"
-        local tmpfull; tmpfull=$(mktemp)
-        git_decompress ".git/objects/${sha:0:2}/${sha:2}" > "$tmpfull"
-        local hlen; hlen=$(first_null_pos "$tmpfull")
-        local type_str; type_str=$(dd if="$tmpfull" bs=1 count="$hlen" 2>/dev/null | awk '{print $1}')
-        local content_size; content_size=$(dd if="$tmpfull" bs=1 skip=$(( hlen + 1 )) 2>/dev/null | wc -c)
-        rm -f "$tmpfull"
-
-        # Object type number
         case "$type_str" in
-            commit) type_num=1 ;; tree) type_num=2 ;; blob) type_num=3 ;; *) type_num=0 ;;
+            commit) type_num=1 ;; tree) type_num=2 ;; blob) type_num=3 ;; *) continue ;;
         esac
 
-        # Encode type+size variable-length header
-        local size="$content_size"
-        local first_byte=$(( (type_num << 4) | (size & 0xF) ))
+        # Decompress body (stored body-only)
+        tmpbody=$(mktemp)
+        git_decompress "$sha" > "$tmpbody"
+        body_size=$(wc -c < "$tmpbody")
+
+        # Variable-length size/type header (git pack format)
+        size="$body_size"
+        first=$(( (type_num << 4) | (size & 0xF) ))
         size=$(( size >> 4 ))
-        local header_bytes=""
+        header_hex=""
         while [ "$size" -gt 0 ]; do
-            header_bytes="$header_bytes$(printf '%02x' $(( first_byte | 0x80 )))"
-            first_byte=$(( size & 0x7F ))
+            header_hex="${header_hex}$(printf '%02x' $(( first | 0x80 )))"
+            first=$(( size & 0x7F ))
             size=$(( size >> 7 ))
         done
-        header_bytes="$header_bytes$(printf '%02x' "$first_byte")"
-        printf "$(printf '%s' "$header_bytes" | sed 's/../\\x&/g')"
+        header_hex="${header_hex}$(printf '%02x' "$first")"
+        printf "$(printf '%s' "$header_hex" | sed 's/../\\x&/g')"
 
-        # zlib-compressed content (same as what's in the object file, minus the 2-byte header prefix)
-        # We already have the object file in zlib format — use it directly but re-compress body
-        tmpbody=$(mktemp)
-        obj_body_to_file "$tmpraw" "$tmpbody"
-        gzip -1 -c -n "$tmpbody"    # gzip format — we'd need to re-wrap as zlib for strict compliance
-        # Note: git pack uses deflate (same as gzip body). For simplicity emit raw gzip here;
-        # most git implementations handle this.
-        rm -f "$tmpbody" "$tmpraw"
-    done <<< "$objects"
+        # zlib-compress body (proper zlib: \x78\x9c header + deflate stream + Adler-32)
+        tmpgz=$(mktemp)
+        gzip -1 -c -n "$tmpbody" > "$tmpgz"
+        gz_size=$(wc -c < "$tmpgz")
+        ds=$(( gz_size - 18 ))
+        adler=$(od -A n -t u1 -v "$tmpbody" | tr -s ' \n' ' ' | sed 's/^ //;s/ $//' | \
+            awk 'BEGIN{a=1;b=0;m=65521}
+                 {n=split($0,v," ");for(i=1;i<=n;i++){d=v[i]+0;a=(a+d)%m;b=(b+a)%m}}
+                 END{printf "%02x%02x%02x%02x",int(b/256)%256,b%256,int(a/256)%256,a%256}')
+        { printf '\x78\x9c'
+          dd if="$tmpgz" bs=1 skip=10 count="$ds" 2>/dev/null
+          printf "$(printf '%s' "$adler" | sed 's/../\\x&/g')"
+        }
+        rm -f "$tmpbody" "$tmpgz"
+    done < "$objects_tmp"
 } > "$pack_tmp"
 
-# Append SHA1 of entire pack content
 pack_sha=$(sha1sum "$pack_tmp" | cut -d' ' -f1)
 printf "$(printf '%s' "$pack_sha" | sed 's/../\\x&/g')" >> "$pack_tmp"
+rm -f "$objects_tmp"
 ```
 
 ### B3. Send via SSH git protocol
 
 ```bash
-# pkt-line helper: 4-hex-char length prefix
-pkt_line() { local s="$1"; printf '%04x%s' $(( ${#s} + 4 )) "$s"; }
-pkt_flush() { printf '0000'; }
-
 zero_sha='0000000000000000000000000000000000000000'
 old_sha="${remote_sha:-$zero_sha}"
 
+# Build pkt-line: "old new ref\0capabilities\n"
+# NUL byte separates ref update from capabilities; length must include it.
+ref_update="${old_sha} ${local_sha} refs/heads/${branch}"
+capabilities="report-status side-band-64k agent=git/2.0"
+payload_len=$(( ${#ref_update} + 1 + ${#capabilities} + 1 ))
+pkt_len=$(( payload_len + 4 ))
+
 {
-    pkt_line "$old_sha $local_sha refs/heads/$branch\0 side-band-64k agent=git-skill\n"
-    pkt_flush
+    printf '%04x' "$pkt_len"
+    printf '%s' "$ref_update"
+    printf '\0'
+    printf '%s\n' "$capabilities"
+    printf '0000'
     cat "$pack_tmp"
-} | ssh "$ssh_host" "git-receive-pack '$repo_path'" 2>&1
+} | ssh -T "$ssh_host" "git-receive-pack '$repo_path'" 2>&1
 
 rm -f "$pack_tmp"
 printf '\nTo %s\n   %s..%s  %s -> %s\n' \
